@@ -15,10 +15,20 @@ const { safeStorage } = require('@electron/remote');
 const configCredentialsKey = 'credentials';
 
 // The real keychain varies by platform and may be locked or absent, so specs replace this.
+//
+// FORK-LOCAL: use the synchronous safeStorage API, not the async one upstream switched to in
+// #2823. On Linux the async path (encrypt/decryptStringAsync) routes through the Secret Portal
+// (org.freedesktop.portal.Secret), which is absent on KDE/Plasma setups that only expose
+// org.freedesktop.Secret.Service (ksecretd/kwallet). There the async decrypt throws and the app
+// refuses to start, and it cannot read blobs the sync API wrote in earlier versions regardless.
+// The sync API talks to Secret.Service directly and decrypts our existing credentials. Wrapped in
+// Promise.resolve so the rest of this async-shaped code is unchanged; sync has no re-encrypt hint.
 export const secureStorage = {
-  isAvailable: (): Promise<boolean> => safeStorage.isAsyncEncryptionAvailable(),
-  encrypt: (plaintext: string): Promise<Buffer> => safeStorage.encryptStringAsync(plaintext),
-  decrypt: (encrypted: Buffer): Promise<DecryptResult> => safeStorage.decryptStringAsync(encrypted),
+  isAvailable: (): Promise<boolean> => Promise.resolve(safeStorage.isEncryptionAvailable()),
+  encrypt: (plaintext: string): Promise<Buffer> =>
+    Promise.resolve(safeStorage.encryptString(plaintext)),
+  decrypt: (encrypted: Buffer): Promise<DecryptResult> =>
+    Promise.resolve({ result: safeStorage.decryptString(encrypted), shouldReEncrypt: false }),
 };
 
 /**
