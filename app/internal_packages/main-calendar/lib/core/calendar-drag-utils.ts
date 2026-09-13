@@ -6,7 +6,18 @@ import {
   HitZone,
   ViewDirection,
 } from './calendar-drag-types';
-import { EventOccurrence } from './calendar-data-source';
+import {
+  EventOccurrence,
+  coveredDates,
+  occurrenceStartUnix,
+  occurrenceEndUnix,
+} from './calendar-data-source';
+import { CalendarDateUtils } from 'mailspring-exports';
+import { inclusiveAllDayEnd } from './calendar-helpers';
+import {
+  DEFAULT_TIMED_EVENT_DURATION_SECONDS,
+  MIN_EVENT_DURATION_SECONDS,
+} from './calendar-constants';
 
 /**
  * Snap a timestamp to the nearest interval
@@ -19,20 +30,72 @@ export function snapToInterval(timestamp: number, intervalSeconds: number): numb
 }
 
 /**
- * Snap all-day event times to day boundaries
- * Start should be at the beginning of a day, end should be at end of day
+ * The unix midnight of the all-day column a horizontal hit-test lands on, given the scope's
+ * bounds and the fraction across it. Date-space on purpose: the column count is derived as a
+ * day difference (so it matches the rendered columns exactly) and the result is a real calendar
+ * day's start, so neither the bucket count nor the resolved day drifts across a DST transition —
+ * unlike `ceil((end - start) / 86400)` buckets and a `start + index * 86400` offset.
+ */
+export function allDayColumnStartUnix(
+  scopeStartUnix: number,
+  scopeEndUnix: number,
+  fraction: number
+): number {
+  const startDate = CalendarDateUtils.calendarDateFromUnix(scopeStartUnix);
+  const numDays =
+    CalendarDateUtils.calendarDaysBetween(
+      startDate,
+      CalendarDateUtils.calendarDateFromUnix(scopeEndUnix)
+    ) + 1;
+  const clamped = Math.max(0, Math.min(1, fraction));
+  const dayIndex = Math.min(Math.floor(clamped * numDays), numDays - 1);
+  return CalendarDateUtils.dayStartUnix(CalendarDateUtils.addCalendarDays(startDate, dayIndex));
+}
+
+/**
+ * Snap all-day event times to day boundaries.
+ * The end is exclusive (midnight after the last day covered), matching RFC 5545 DTEND
+ * and the events the sync engine produces.
  * @param start Start timestamp
  * @param end End timestamp
  * @returns Snapped start and end times
  */
 export function snapAllDayTimes(start: number, end: number): { start: number; end: number } {
-  // Start at beginning of day
   const snappedStart = moment.unix(start).startOf('day').unix();
+  return { start: snappedStart, end: exclusiveDayEnd(end, snappedStart) };
+}
 
-  // End at end of day (23:59:59)
-  const snappedEnd = moment.unix(end).endOf('day').unix();
+/**
+ * Midnight after the last day a range covers, floored so a degenerate end still yields
+ * one whole day. Uses calendar-day arithmetic rather than adding 24 hours, which drifts
+ * in zones whose DST transition falls at midnight.
+ * @param end End timestamp
+ * @param floor Earliest day that may be treated as covered
+ * @returns Exclusive end, as a unix timestamp
+ */
+function exclusiveDayEnd(end: number, floor: number): number {
+  return CalendarDateUtils.nextDayStartUnix(
+    CalendarDateUtils.calendarDateFromUnix(Math.max(inclusiveAllDayEnd(end), floor))
+  );
+}
 
-  return { start: snappedStart, end: snappedEnd };
+/**
+ * Moves an instant onto the calendar day under the cursor without touching its clock time.
+ *
+ * Whole calendar days rather than a seconds delta: moment's add() holds 2pm at 2pm across a
+ * DST transition, where adding 86400 seconds lands an hour out.
+ *
+ * @param instant The instant to move
+ * @param drawnAt The day that instant is drawn on, which is the one being dragged from
+ * @param mouseTime Any instant on the day under the cursor
+ * @returns The moved instant, as a unix timestamp
+ */
+function shiftDateKeepingClock(instant: number, drawnAt: number, mouseTime: number): number {
+  const daysDelta = CalendarDateUtils.calendarDaysBetween(
+    CalendarDateUtils.calendarDateFromUnix(drawnAt),
+    CalendarDateUtils.calendarDateFromUnix(mouseTime)
+  );
+  return moment.unix(instant).add(daysDelta, 'days').unix();
 }
 
 /**
@@ -44,14 +107,18 @@ export function snapAllDayTimes(start: number, end: number): { start: number; en
  */
 export function createDragPreviewEvent(dragState: DragState): EventOccurrence {
   const { event, previewStart, previewEnd } = dragState;
-  return {
+  // coveredDates replaces the spread's pre-drag dates. Timed previews also carry the preview
+  // instants; all-day previews carry only the shifted dates.
+  const shared = {
     ...event,
+    ...coveredDates(previewStart, previewEnd, dragState.previewIsAllDay),
     id: `${event.id}-drag-preview`,
-    start: previewStart,
-    end: previewEnd,
     isDragPreview: true,
     originalEventId: event.id,
   };
+  return dragState.previewIsAllDay
+    ? { ...shared, isAllDay: true }
+    : { ...shared, isAllDay: false, start: previewStart, end: previewEnd };
 }
 
 /**
@@ -165,29 +232,30 @@ export function createDragState(
   mouseY: number,
   config: DragConfig
 ): DragState {
-  // Calculate click offset for 'move' mode - this is the time difference between
-  // where the user clicked and the event's start time. We'll preserve this offset
-  // so the event doesn't jump when dragging starts.
+  // The drag pipeline is unix; derive the event's instants once (all-day carries dates only).
+  const start = occurrenceStartUnix(event);
+  const end = occurrenceEndUnix(event);
+
+  // The grab offset keeps the event from jumping when the drag starts. `mouseTime` comes from
+  // the grid, so it is measured against the grid's reading of the edge, not the edge itself.
   let clickOffset = 0;
   if (hitZone.mode === 'move') {
-    clickOffset = mouseTime - event.start;
+    clickOffset = mouseTime - CalendarDateUtils.firstOccurrenceUnix(start);
   } else if (hitZone.mode === 'resize-end') {
-    // For resize-end, offset is from the end of the event
-    clickOffset = mouseTime - event.end;
+    clickOffset = mouseTime - CalendarDateUtils.firstOccurrenceUnix(end);
   }
-  // For resize-start, no offset needed (we resize from start time)
 
   return {
     mode: hitZone.mode,
     event,
-    originalStart: event.start,
-    originalEnd: event.end,
-    initialMouseTime: mouseTime,
+    originalStart: start,
+    originalEnd: end,
     clickOffset,
     initialMouseX: mouseX,
     initialMouseY: mouseY,
-    previewStart: event.start,
-    previewEnd: event.end,
+    previewStart: start,
+    previewEnd: end,
+    previewIsAllDay: event.isAllDay,
     snapIntervalSeconds: config.snapInterval,
     isDragging: false,
   };
@@ -236,66 +304,128 @@ export function updateDragState(
   // - all-day-area, month-cell: full day intervals
   const usesDaySnap = containerType !== 'day-column';
   const snapInterval = usesDaySnap ? 86400 : config.snapInterval; // 86400 = 1 day in seconds
-  const minDuration = usesDaySnap ? 86400 : config.minDuration;
+  // A move converts between kinds when the drop container disagrees with the event: the all-day
+  // row makes a timed event all-day, the timed grid (day-column) makes an all-day event timed. A
+  // month cell preserves the event's kind. Recurring events are NOT converted yet:
+  // createRecurrenceException threads one isAllDay through both the exception times and the
+  // RECURRENCE-ID, so a convert would misformat the RID and orphan the exception — a recurring
+  // event dropped across kinds keeps its own kind (moves to that day) instead.
+  const canConvert = state.mode === 'move' && !state.event.isRecurring;
+  const previewIsAllDay =
+    containerType === 'all-day-area'
+      ? state.event.isAllDay || canConvert
+      : containerType === 'day-column'
+        ? state.event.isAllDay && !canConvert
+        : state.event.isAllDay;
+  // A day-granular config carries the all-day rule, one whole day. A timed event resized on
+  // such a surface keeps its clock time, so its floor is the ordinary shortest event.
+  const minDuration =
+    usesDaySnap && !previewIsAllDay ? MIN_EVENT_DURATION_SECONDS : config.minDuration;
 
   switch (state.mode) {
     case 'move': {
-      // For move, calculate new start by subtracting the click offset from current mouse position
-      // This keeps the event at the same position relative to the mouse cursor
-      // For day-based snapping, ignore click offset since we snap to day boundaries
-      const newStart = usesDaySnap ? mouseTime : mouseTime - state.clickOffset;
-      if (usesDaySnap) {
-        // For day-based moves, snap start to beginning of day and end to end of day
-        // Calculate how many days the event spans (minimum 1)
-        const numDays = Math.max(1, Math.round(eventDuration / 86400));
-        previewStart = moment.unix(newStart).startOf('day').unix();
-        previewEnd = moment
-          .unix(previewStart)
-          .add(numDays - 1, 'days')
-          .endOf('day')
-          .unix();
+      if (previewIsAllDay) {
+        // Target is all-day. An all-day event keeps its whole-day span; a converting timed
+        // event becomes a single day. Snap the start, then span that many whole days.
+        const numDays = state.event.isAllDay ? Math.max(1, Math.round(eventDuration / 86400)) : 1;
+        previewStart = moment.unix(mouseTime).startOf('day').unix();
+        // Via the helpers, not a raw add: where the drop day's midnight doesn't exist, add()
+        // keeps the 01:00 wall clock and snapAllDayTimes then rounds it up an extra day.
+        previewEnd = CalendarDateUtils.nextDayStartUnix(
+          CalendarDateUtils.addCalendarDays(
+            CalendarDateUtils.calendarDateFromUnix(previewStart),
+            numDays - 1
+          )
+        );
+      } else if (state.event.isAllDay) {
+        // Converting an all-day event into the timed grid (reached only in day-column, the one
+        // place previewIsAllDay flips false for an all-day event). It has no clock time to keep,
+        // so drop its start at the snapped cursor time and give it the default new-event length.
+        previewStart = snapToInterval(mouseTime, snapInterval);
+        previewEnd = previewStart + DEFAULT_TIMED_EVENT_DURATION_SECONDS;
+      } else if (usesDaySnap) {
+        // Timed event on a day-granular surface — a month cell, or a recurring event on the
+        // all-day row (not converted). Shift by whole calendar days and keep the clock time;
+        // moment add() holds 10am at 10am across a DST change.
+        const daysDelta = CalendarDateUtils.calendarDaysBetween(
+          CalendarDateUtils.calendarDateFromUnix(state.originalStart),
+          CalendarDateUtils.calendarDateFromUnix(mouseTime)
+        );
+        previewStart = moment.unix(state.originalStart).add(daysDelta, 'days').unix();
+        previewEnd = previewStart + eventDuration;
       } else {
-        previewStart = snapToInterval(newStart, snapInterval);
+        // A grid reading inside a repeated hour names two instants; stay on the event's side.
+        previewStart = CalendarDateUtils.sameOffsetOccurrenceUnix(
+          snapToInterval(mouseTime - state.clickOffset, snapInterval),
+          state.originalStart
+        );
         previewEnd = previewStart + eventDuration;
       }
       break;
     }
     case 'resize-start': {
-      // For resize-start, new start is at mouse position
-      // For day-based snapping, snap to start of the day the cursor is in
-      const newStart = Math.min(mouseTime, state.originalEnd - minDuration);
-      if (usesDaySnap) {
-        previewStart = moment.unix(newStart).startOf('day').unix();
-        // Ensure end is at end of day (in case original wasn't properly aligned)
-        previewEnd = moment.unix(state.originalEnd).endOf('day').unix();
-      } else {
-        previewStart = snapToInterval(newStart, snapInterval);
+      if (usesDaySnap && !previewIsAllDay) {
+        // A timed event on a day-granular surface - a month cell - resizes by whole days,
+        // but 2pm is still 2pm afterwards: only the date of its start moves. Snapping it to
+        // midnight the way an all-day event is snapped would silently discard the meeting's
+        // time of day, since a timed preview is persisted exactly as it stands here.
         previewEnd = state.originalEnd;
-      }
-      // Ensure minimum duration after snapping
-      if (previewEnd - previewStart < minDuration) {
-        previewStart = previewEnd - minDuration;
+        previewStart = shiftDateKeepingClock(state.originalStart, state.originalStart, mouseTime);
+        if (previewEnd - previewStart < minDuration) {
+          previewStart = previewEnd - minDuration;
+        }
+      } else if (usesDaySnap) {
+        // Clamp to the last day covered rather than subtracting seconds: one calendar day
+        // is 82800s on a spring-forward day, so a seconds floor lands off midnight.
+        const lastDay = inclusiveAllDayEnd(state.originalEnd);
+        previewStart = moment.unix(Math.min(mouseTime, lastDay)).startOf('day').unix();
+        previewEnd = exclusiveDayEnd(state.originalEnd, previewStart);
+      } else {
+        previewStart = CalendarDateUtils.sameOffsetOccurrenceUnix(
+          snapToInterval(mouseTime, snapInterval),
+          state.originalStart
+        );
+        previewEnd = state.originalEnd;
+        // Ensure minimum duration after snapping
+        if (previewEnd - previewStart < minDuration) {
+          previewStart = previewEnd - minDuration;
+        }
       }
       break;
     }
     case 'resize-end': {
-      // For resize-end, new end is at mouse position
-      // For day-based snapping, snap to END of the day the cursor is in (not start)
-      // Don't use click offset for day-based operations
-      const newEnd = usesDaySnap
-        ? mouseTime
-        : Math.max(mouseTime - state.clickOffset, state.originalStart + minDuration);
-      if (usesDaySnap) {
-        // Ensure start is at start of day (in case original wasn't properly aligned)
+      if (usesDaySnap && !previewIsAllDay) {
+        // As in resize-start: whole days of movement, unchanged clock time. The end's own
+        // day is the last one it covers, so an event ending at midnight is dragged from the
+        // day it is drawn on rather than from the day after.
+        previewStart = state.originalStart;
+        previewEnd = shiftDateKeepingClock(
+          state.originalEnd,
+          inclusiveAllDayEnd(state.originalEnd),
+          mouseTime
+        );
+        if (previewEnd - previewStart < minDuration) {
+          previewEnd = previewStart + minDuration;
+        }
+      } else if (usesDaySnap) {
+        // mouseTime is the day under the cursor, not an end, so it must not go through
+        // inclusiveAllDayEnd — containers hand over an exact midnight and the -1s there
+        // would drop the cursor's own day. Include that day, then take the next midnight.
         previewStart = moment.unix(state.originalStart).startOf('day').unix();
-        previewEnd = moment.unix(newEnd).endOf('day').unix();
+        const lastDay = Math.max(moment.unix(mouseTime).startOf('day').unix(), previewStart);
+        previewEnd = CalendarDateUtils.nextDayStartUnix(
+          CalendarDateUtils.calendarDateFromUnix(lastDay)
+        );
       } else {
         previewStart = state.originalStart;
-        previewEnd = snapToInterval(newEnd, snapInterval);
-      }
-      // Ensure minimum duration after snapping
-      if (previewEnd - previewStart < minDuration) {
-        previewEnd = previewStart + minDuration;
+        previewEnd = CalendarDateUtils.sameOffsetOccurrenceUnix(
+          snapToInterval(mouseTime - state.clickOffset, snapInterval),
+          state.originalEnd
+        );
+        // Ensure minimum duration after snapping
+        if (previewEnd - previewStart < minDuration) {
+          previewEnd = previewStart + minDuration;
+        }
       }
       break;
     }
@@ -305,7 +435,8 @@ export function updateDragState(
   if (
     isDragging === state.isDragging &&
     previewStart === state.previewStart &&
-    previewEnd === state.previewEnd
+    previewEnd === state.previewEnd &&
+    previewIsAllDay === state.previewIsAllDay
   ) {
     return state;
   }
@@ -315,22 +446,23 @@ export function updateDragState(
     isDragging,
     previewStart,
     previewEnd,
+    previewIsAllDay,
   };
 }
 
 /**
- * Check if an event can be dragged (not read-only, not cancelled, etc.)
+ * Check if an event's time can be changed by drag, resize, or keyboard
  * @param event The event occurrence
  * @param isCalendarReadOnly Whether the calendar containing this event is read-only
- * @returns True if event can be dragged
+ * @returns True if the event can be moved
  */
-export function canDragEvent(event: EventOccurrence, isCalendarReadOnly = false): boolean {
-  // Don't allow dragging events in read-only calendars
+export function canMoveEvent(event: EventOccurrence, isCalendarReadOnly = false): boolean {
+  // Don't allow moving events in read-only calendars
   if (isCalendarReadOnly) {
     return false;
   }
 
-  // Don't allow dragging cancelled events
+  // Don't allow moving cancelled events
   if (event.isCancelled) {
     return false;
   }
@@ -348,7 +480,7 @@ export function canDragEvent(event: EventOccurrence, isCalendarReadOnly = false)
 export function formatDragPreviewTime(start: number, end: number, isAllDay: boolean): string {
   if (isAllDay) {
     const startDate = moment.unix(start).format('MMM D');
-    const endDate = moment.unix(end).format('MMM D');
+    const endDate = moment.unix(end - 1).format('MMM D');
     if (startDate === endDate) {
       return startDate;
     }

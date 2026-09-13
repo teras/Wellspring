@@ -3,7 +3,8 @@ import ReactDOM from 'react-dom';
 import * as Immutable from 'immutable';
 import { Editor, Value, Operation, Range, Block, Text, Point } from 'slate';
 import { Editor as SlateEditorComponent, EditorProps, Plugin } from 'slate-react';
-import { clipboard as ElectronClipboard } from 'electron';
+import Plain from 'slate-plain-serializer';
+import { webUtils } from 'electron';
 import { InlineStyleTransformer, SanitizeTransformer } from 'mailspring-exports';
 import os from 'os';
 import path from 'path';
@@ -69,6 +70,10 @@ function isSelectionBroken(value: Value, operations: Immutable.List<Operation>):
 const AEditor = SlateEditorComponent as any as React.ComponentType<
   EditorProps & { ref: any; propsForPlugins: any }
 >;
+
+export function normalizePlainTextForPaste(text: string) {
+  return text.replace(/\r\n?/g, '\n');
+}
 
 interface ComposerEditorProps {
   value: Value;
@@ -300,7 +305,28 @@ export class ComposerEditor extends React.Component<ComposerEditorProps, Compose
       }
     }
 
-    // fall back to Slate's default behavior
+    // Slate's plain-text paste handler splits on `\n` without first normalizing Windows
+    // CRLF line endings. This leaves a stray `\r` in every block; a blank line becomes a
+    // block containing only `\r`, which our HTML serializer later emits as `&nbsp;`.
+    // Handle plain text here so the editor model, composer preview, and sent HTML all
+    // represent blank lines the same way.
+    const text = event.clipboardData.getData('text/plain');
+    if (text) {
+      const { document, selection, startBlock } = editor.value;
+      // Slate's runtime Editor includes isVoid, but the TypeScript declaration omits it.
+      if (!startBlock || (editor as any)?.isVoid(startBlock)) return next();
+
+      const fragment = Plain.deserialize(normalizePlainTextForPaste(text), {
+        defaultBlock: startBlock as any,
+        defaultMarks: document.getInsertMarksAtRange(selection as any) as any,
+      }).document;
+
+      editor.insertFragment(fragment);
+      event.preventDefault();
+      return;
+    }
+
+    // Fall back to Slate for clipboard types we do not handle.
     return next();
   };
 
@@ -415,6 +441,16 @@ export function handleFilePasted(event: ClipboardEvent, onFileReceived: (path: s
     // file and fire our `onFilePaste` event.
     if (item.kind === 'file') {
       const blob = item.getAsFile();
+
+      // Chromium exposes files copied in Finder / Explorer / a Linux file manager as
+      // file items backed by the real file. Attach those by path so the original
+      // filename is kept; only pasteboard-only blobs (screenshots) need a temp copy.
+      const existingPath = webUtils.getPathForFile(blob);
+      if (existingPath) {
+        onFileReceived(existingPath);
+        return true;
+      }
+
       const ext =
         {
           'image/png': '.png',
@@ -436,25 +472,6 @@ export function handleFilePasted(event: ClipboardEvent, onFileReceived: (path: s
       reader.readAsArrayBuffer(blob);
       return true;
     }
-  }
-
-  const macCopiedFile = decodeURI(ElectronClipboard.read('public.file-url').replace('file://', ''));
-  const winCopiedFile = ElectronClipboard.read('FileNameW').replace(
-    new RegExp(String.fromCharCode(0), 'g'),
-    ''
-  );
-  const xdgCopiedFiles = (ElectronClipboard.read('text/uri-list') || '')
-    .split('\r\n') // yes, really
-    .filter((path) => path.startsWith('file://'))
-    .map((path) => path.replace('file://', ''))
-    .filter((path) => path.length);
-  if (macCopiedFile.length || winCopiedFile.length) {
-    onFileReceived(macCopiedFile || winCopiedFile);
-    return true;
-  }
-  if (xdgCopiedFiles.length) {
-    xdgCopiedFiles.forEach(onFileReceived);
-    return true;
   }
 
   return false;

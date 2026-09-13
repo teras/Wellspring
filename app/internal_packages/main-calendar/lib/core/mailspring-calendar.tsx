@@ -1,5 +1,6 @@
 import moment, { Moment } from 'moment';
 import React from 'react';
+import { ipcRenderer } from 'electron';
 import {
   Rx,
   DatabaseStore,
@@ -8,7 +9,8 @@ import {
   Account,
   Actions,
   localized,
-  DestroyModelTask,
+  CalendarDateUtils,
+  DestroyEventTask,
   Event,
   SyncbackEventTask,
   ICSEventHelpers,
@@ -25,15 +27,25 @@ import { WeekView } from './week-view';
 import { MonthView } from './month-view';
 import { AgendaView } from './agenda-view';
 import { CalendarSourceList } from './calendar-source-list';
-import { CalendarDataSource, EventOccurrence, FocusedEventInfo } from './calendar-data-source';
-import { CalendarView } from './calendar-constants';
+import {
+  CalendarDataSource,
+  EventOccurrence,
+  FocusedEventInfo,
+  coveredDates,
+  occurrenceStartUnix,
+  occurrenceEndUnix,
+} from './calendar-data-source';
+import { CalendarView, DEFAULT_TIMED_EVENT_DURATION_SECONDS } from './calendar-constants';
 import { CalendarEmptyState } from './calendar-empty-state';
 import {
   setCalendarColors,
   getColorCacheVersion,
   getEditableCalendars,
   showNoEditableCalendarsError,
+  showReadOnlyCalendarError,
   invalidateThemeTextColorCache,
+  shiftEndWithStart,
+  clampEnd,
 } from './calendar-helpers';
 import { Disposable } from 'rx-core';
 import { CalendarEventArgs } from './calendar-event-container';
@@ -49,6 +61,7 @@ import {
   updateDragState,
   parseEventIdFromOccurrence,
   snapAllDayTimes,
+  canMoveEvent,
 } from './calendar-drag-utils';
 import { showRecurringEventDialog } from './recurring-event-dialog';
 import { modifyEventWithRecurringSupport, EventTimeChangeOptions } from './recurring-event-actions';
@@ -89,12 +102,14 @@ export interface MailspringCalendarViewProps extends EventRendererProps {
   onEventDragStart: (
     event: EventOccurrence,
     mouseEvent: React.MouseEvent,
-    hitZone: HitZone,
-    mouseTime: number
+    hitZone: HitZone
   ) => void;
 
   /** Set of calendar IDs that are read-only (events in these calendars cannot be dragged) */
   readOnlyCalendarIds: Set<string>;
+
+  /** Fail-closed read-only check; prefer this over readOnlyCalendarIds for write decisions */
+  isCalendarReadOnly: (calendarId: string) => boolean;
 }
 
 /*
@@ -163,7 +178,7 @@ export class MailspringCalendar extends React.Component<
 
   componentWillUnmount() {
     // The component is unmounting, dispose subscriptions
-    this._disposable.dispose();
+    this._disposable?.dispose();
     this._themeDisposable?.dispose();
     if (this._unlisten) {
       this._unlisten();
@@ -199,9 +214,25 @@ export class MailspringCalendar extends React.Component<
     );
   }
 
+  /**
+   * Single source of truth for whether an event's calendar may be written to.
+   * Fails closed until the calendar subscription first emits, since events render
+   * from an independent subscription and can paint before calendars resolve.
+   */
+  _isCalendarReadOnly = (calendarId: string): boolean => {
+    return !this.state.calendarsLoaded || this.state.readOnlyCalendarIds.has(calendarId);
+  };
+
   onChangeView = (view: CalendarView) => {
+    // If an event is selected, jump the new view to where it lives so it stays visible and
+    // selected (matching Apple Calendar) — switching to a narrow view could otherwise leave the
+    // selected event off-screen.
+    const selected = this.state.selectedEvents[0];
+    const focusedMoment = selected
+      ? moment.unix(occurrenceStartUnix(selected))
+      : this.state.focusedMoment;
     // Clear any active drag state when changing views
-    this.setState({ view, dragState: null });
+    this.setState({ view, dragState: null, focusedMoment });
     AppEnv.config.set(CALENDAR_VIEW, view);
   };
 
@@ -226,12 +257,18 @@ export class MailspringCalendar extends React.Component<
     const direction = isDayView ? 'down' : 'right';
     const fallbackDirection = isDayView ? 'up' : 'left';
 
-    Actions.openPopover(<CalendarEventPopover event={eventModel} />, {
-      originRect: eventEl.getBoundingClientRect(),
-      direction,
-      fallbackDirection,
-      closeOnAppBlur: false,
-    });
+    Actions.openPopover(
+      <CalendarEventPopover
+        event={eventModel}
+        isCalendarReadOnly={this._isCalendarReadOnly(eventModel.calendarId)}
+      />,
+      {
+        originRect: eventEl.getBoundingClientRect(),
+        direction,
+        fallbackDirection,
+        closeOnAppBlur: false,
+      }
+    );
   }
 
   _onEventClick = (e: React.MouseEvent, event: EventOccurrence) => {
@@ -309,17 +346,18 @@ export class MailspringCalendar extends React.Component<
       startUnix = Math.round(args.time / thirtyMinutes) * thirtyMinutes;
     }
 
-    const endUnix = isAllDay ? startUnix + 86400 : startUnix + 3600; // 1 day or 1 hour
+    const endUnix = isAllDay
+      ? CalendarDateUtils.nextDayStartUnix(CalendarDateUtils.calendarDateFromUnix(startUnix))
+      : startUnix + DEFAULT_TIMED_EVENT_DURATION_SECONDS;
 
-    // Build a temporary EventOccurrence to open the popover in "new event" mode
-    const newEventOccurrence: EventOccurrence = {
+    // Build a temporary EventOccurrence to open the popover in "new event" mode. Build the
+    // right variant — an all-day new event carries dates only, like every other occurrence.
+    const base = {
       id: `__new_event_${Date.now()}`,
-      start: startUnix,
-      end: endUnix,
+      ...coveredDates(startUnix, endUnix, isAllDay),
       title: '',
       description: '',
       location: '',
-      isAllDay,
       isRecurring: false,
       isCancelled: false,
       isPending: false,
@@ -329,6 +367,9 @@ export class MailspringCalendar extends React.Component<
       accountId: editableCalendars[0].accountId,
       calendarId: editableCalendars[0].id,
     };
+    const newEventOccurrence: EventOccurrence = isAllDay
+      ? { ...base, isAllDay: true }
+      : { ...base, isAllDay: false, start: startUnix, end: endUnix };
 
     // Open the popover anchored near the mouse position
     const originRect = new DOMRect(args.mouseEvent.clientX - 1, args.mouseEvent.clientY - 1, 2, 2);
@@ -359,22 +400,36 @@ export class MailspringCalendar extends React.Component<
       return;
     }
 
+    // Partition before prompting so the dialog can disclose a partial delete
+    const selected = this.state.selectedEvents;
+    const deletable = selected.filter((o) => !this._isCalendarReadOnly(o.calendarId));
+    if (deletable.length === 0) {
+      showReadOnlyCalendarError();
+      return;
+    }
+    const skipped = selected.length - deletable.length;
+
     // Show initial confirmation dialog
     const response = require('@electron/remote').dialog.showMessageBoxSync({
       type: 'warning',
       buttons: [localized('Delete'), localized('Cancel')],
       message: localized('Delete or decline these events?'),
-      detail: localized(
-        `Are you sure you want to delete or decline invitations for the selected event(s)?`
-      ),
+      detail: skipped
+        ? localized(
+            "%1$@ of the %2$@ selected events will be deleted. The rest are on read-only calendars and can't be changed.",
+            deletable.length,
+            selected.length
+          )
+        : localized(
+            `Are you sure you want to delete or decline invitations for the selected event(s)?`
+          ),
     });
 
     if (response !== 0) {
       return; // User cancelled
     }
 
-    // Process each selected event
-    for (const occurrence of this.state.selectedEvents) {
+    for (const occurrence of deletable) {
       await this._deleteEvent(occurrence);
     }
   };
@@ -440,7 +495,7 @@ export class MailspringCalendar extends React.Component<
     // Add EXDATE to exclude this occurrence
     masterEvent.ics = ICSEventHelpers.addExclusionDate(
       masterEvent.ics,
-      occurrence.start,
+      occurrenceStartUnix(occurrence),
       occurrence.isAllDay
     );
 
@@ -457,13 +512,7 @@ export class MailspringCalendar extends React.Component<
    * Delete an entire event (or series)
    */
   async _deleteEntireEvent(event: Event) {
-    const task = new DestroyModelTask({
-      modelId: event.id,
-      modelName: event.constructor.name,
-      endpoint: '/events',
-      accountId: event.accountId,
-    });
-    Actions.queueTask(task);
+    Actions.queueTask(DestroyEventTask.forRemoving({ events: [event] }));
   }
 
   /**
@@ -474,26 +523,14 @@ export class MailspringCalendar extends React.Component<
   }
 
   /**
-   * Handle drag start from an event
+   * A grab waiting for its position: the event's mousedown lands here first, then bubbles to
+   * the CalendarEventContainer, whose hit-test hands _onCalendarMouseDown the grid time and
+   * container coordinates under the cursor — the same frame every later drag target uses.
    */
-  _onEventDragStart = (
-    event: EventOccurrence,
-    mouseEvent: React.MouseEvent,
-    hitZone: HitZone,
-    mouseTime: number
-  ) => {
-    const config = this._getDragConfig();
+  _pendingDrag: { event: EventOccurrence; hitZone: HitZone } | null = null;
 
-    const dragState = createDragState(
-      event,
-      hitZone,
-      mouseTime,
-      mouseEvent.clientX,
-      mouseEvent.clientY,
-      config
-    );
-
-    this.setState({ dragState });
+  _onEventDragStart = (event: EventOccurrence, _mouseEvent: React.MouseEvent, hitZone: HitZone) => {
+    this._pendingDrag = { event, hitZone };
   };
 
   /**
@@ -543,10 +580,13 @@ export class MailspringCalendar extends React.Component<
       return;
     }
 
-    // Check if times actually changed
+    // Check if the times OR the kind actually changed. A timed event dropped on the all-day
+    // row can convert with identical instants (e.g. a midnight-to-midnight event), so a
+    // times-only check would silently drop the conversion.
     if (
       dragState.previewStart === dragState.originalStart &&
-      dragState.previewEnd === dragState.originalEnd
+      dragState.previewEnd === dragState.originalEnd &&
+      dragState.previewIsAllDay === dragState.event.isAllDay
     ) {
       // No change, just clear state
       this.setState({ dragState: null });
@@ -557,11 +597,21 @@ export class MailspringCalendar extends React.Component<
     this._persistDragChange(dragState);
   };
 
-  /**
-   * Handle mouse down on calendar
-   */
-  _onCalendarMouseDown = (_args: CalendarEventArgs) => {
-    // No-op: mouseUp handles drag completion, mouseMove handles drag updates
+  _onCalendarMouseDown = (args: CalendarEventArgs) => {
+    const pending = this._pendingDrag;
+    this._pendingDrag = null;
+    if (!pending || args.time === null) {
+      return;
+    }
+    const dragState = createDragState(
+      pending.event,
+      pending.hitZone,
+      args.time,
+      args.x,
+      args.y,
+      this._getDragConfig()
+    );
+    this.setState({ dragState });
   };
 
   /**
@@ -574,8 +624,12 @@ export class MailspringCalendar extends React.Component<
 
     const occurrence = this.state.selectedEvents[0];
 
-    // Check if event is in a read-only calendar
-    if (this.state.readOnlyCalendarIds.has(occurrence.calendarId)) {
+    if (!canMoveEvent(occurrence, this._isCalendarReadOnly(occurrence.calendarId))) {
+      return;
+    }
+
+    // All-day events have no time of day, so up/down has nothing to move
+    if (occurrence.isAllDay && (direction === 'up' || direction === 'down')) {
       return;
     }
 
@@ -632,18 +686,39 @@ export class MailspringCalendar extends React.Component<
         return;
       }
 
-      // Calculate new times
+      // The keyboard pipeline is unix, so derive instants for all-day occurrences (dates only).
+      const occStart = occurrenceStartUnix(occurrence);
+      const occEnd = occurrenceEndUnix(occurrence);
       let newStart: number;
       let newEnd: number;
 
-      if (isResize) {
+      if (occurrence.isAllDay) {
+        // Only left/right reaches here, so the delta is a day in either direction. Shifting
+        // by calendar days rather than 86400 seconds keeps the times on midnight across a
+        // DST transition, where a seconds shift overshoots and snaps up an extra day.
+        const days = Math.sign(timeDelta);
+        newStart = isResize ? occStart : CalendarDateUtils.shiftedDayStartUnix(occStart, days);
+        newEnd = isResize
+          ? clampEnd(newStart, CalendarDateUtils.shiftedDayStartUnix(occEnd, days), true)
+          : shiftEndWithStart(occStart, occEnd, newStart, true);
+        const snapped = snapAllDayTimes(newStart, newEnd);
+        newStart = snapped.start;
+        newEnd = snapped.end;
+      } else if (isResize) {
         // Shift+Arrow: resize the event (change end time only)
-        newStart = occurrence.start;
-        newEnd = Math.max(occurrence.end + timeDelta, occurrence.start + 900); // Min 15 min
+        newStart = occStart;
+        newEnd = clampEnd(newStart, occEnd + timeDelta, false);
       } else {
         // Arrow: move the event (change both start and end)
-        newStart = occurrence.start + timeDelta;
-        newEnd = occurrence.end + timeDelta;
+        newStart = occStart + timeDelta;
+        newEnd = occEnd + timeDelta;
+      }
+
+      // Resizing at the minimum duration clamps back to the current end, so the change can
+      // be a no-op. Bail like the mouse-up path does, rather than queueing a syncback and an
+      // undo toast for an identical event — or prompting for a recurring series that won't move.
+      if (newStart === occStart && newEnd === occEnd) {
+        return;
       }
 
       // Use shared utility for recurring event support (shows dialog if needed)
@@ -652,7 +727,7 @@ export class MailspringCalendar extends React.Component<
         // For inline exceptions, use the RECURRENCE-ID value (recurrenceIdStart), NOT the
         // exception's moved DTSTART (start). Using start would produce the wrong RECURRENCE-ID
         // in the new exception, causing the upsert to miss the existing one and leave a duplicate.
-        originalOccurrenceStart: occurrence.recurrenceIdStart ?? occurrence.start,
+        originalOccurrenceStart: occurrence.recurrenceIdStart ?? occStart,
         newStart,
         newEnd,
         isAllDay: occurrence.isAllDay,
@@ -692,9 +767,7 @@ export class MailspringCalendar extends React.Component<
         return;
       }
 
-      // Check if calendar is read-only (safety check)
-      const calendar = this.state.calendars.find((c) => c.id === event.calendarId);
-      if (calendar?.readOnly) {
+      if (this._isCalendarReadOnly(event.calendarId)) {
         console.warn('Cannot modify event in read-only calendar');
         return;
       }
@@ -703,7 +776,7 @@ export class MailspringCalendar extends React.Component<
       let newStart = dragState.previewStart;
       let newEnd = dragState.previewEnd;
 
-      if (dragState.event.isAllDay) {
+      if (dragState.previewIsAllDay) {
         const snapped = snapAllDayTimes(newStart, newEnd);
         newStart = snapped.start;
         newEnd = snapped.end;
@@ -715,10 +788,11 @@ export class MailspringCalendar extends React.Component<
         // For inline exceptions, use the RECURRENCE-ID value (recurrenceIdStart), NOT the
         // exception's moved DTSTART (start). Using start would produce the wrong RECURRENCE-ID
         // in the new exception, causing the upsert to miss the existing one and leave a duplicate.
-        originalOccurrenceStart: dragState.event.recurrenceIdStart ?? dragState.event.start,
+        originalOccurrenceStart:
+          dragState.event.recurrenceIdStart ?? occurrenceStartUnix(dragState.event),
         newStart,
         newEnd,
-        isAllDay: dragState.event.isAllDay,
+        isAllDay: dragState.previewIsAllDay,
         isException: dragState.event.isException,
         description:
           dragState.mode === 'move' ? localized('Move event') : localized('Resize event'),
@@ -797,11 +871,8 @@ export class MailspringCalendar extends React.Component<
     AppEnv.config.set(CALENDAR_LIST_VISIBLE, visible);
   };
 
-  /**
-   * Refresh calendars by triggering a sync.
-   */
   _onRefreshCalendars = () => {
-    AppEnv.mailsyncBridge.sendSyncMailNow();
+    ipcRenderer.send('command', 'application:sync-calendar');
   };
 
   _shouldShowEmptyState() {
@@ -835,6 +906,7 @@ export class MailspringCalendar extends React.Component<
         dragState={this.state.dragState}
         onEventDragStart={this._onEventDragStart}
         readOnlyCalendarIds={this.state.readOnlyCalendarIds}
+        isCalendarReadOnly={this._isCalendarReadOnly}
       />
     );
   }

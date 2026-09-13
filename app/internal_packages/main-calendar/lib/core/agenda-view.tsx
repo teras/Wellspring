@@ -1,12 +1,18 @@
 import React from 'react';
 import moment, { Moment } from 'moment-timezone';
 import { ScrollRegion, InjectedComponentSet } from 'mailspring-component-kit';
-import { localized, Actions } from 'mailspring-exports';
+import { localized, Actions, CalendarDateUtils } from 'mailspring-exports';
 import { MailspringCalendarViewProps } from './mailspring-calendar';
 import { CalendarView } from './calendar-constants';
 import { HeaderControls } from './header-controls';
 import { CalendarEventPopover } from './calendar-event-popover';
-import { EventOccurrence } from './calendar-data-source';
+import {
+  EventOccurrence,
+  eventCoversDate,
+  isTimed,
+  occurrenceStartUnix,
+  isEventSelected,
+} from './calendar-data-source';
 import { Disposable } from 'rx-core';
 import { calcEventColors, extractMeetingDomain } from './calendar-helpers';
 
@@ -86,16 +92,15 @@ export class AgendaView extends React.Component<MailspringCalendarViewProps, Age
 
     for (let i = 0; i < DAYS_IN_VIEW; i++) {
       const day = moment(focusedMoment).startOf('day').add(i, 'days');
-      const dayStart = day.unix();
-      const dayEnd = day.clone().endOf('day').unix();
+      const date = CalendarDateUtils.calendarDateFromUnix(day.unix());
 
       const events = this.state.events
-        .filter((event) => event.start < dayEnd && event.end > dayStart)
+        .filter((event) => eventCoversDate(event, date))
         .sort((a, b) => {
           // All-day events first, then sort by start time
           if (a.isAllDay && !b.isAllDay) return -1;
           if (!a.isAllDay && b.isAllDay) return 1;
-          return a.start - b.start;
+          return occurrenceStartUnix(a) - occurrenceStartUnix(b);
         });
 
       days.push({ day, events });
@@ -123,12 +128,12 @@ export class AgendaView extends React.Component<MailspringCalendarViewProps, Age
   };
 
   _formatEventTime(event: EventOccurrence): string {
-    if (event.isAllDay) {
-      return localized('All day');
+    if (isTimed(event)) {
+      const start = moment.unix(event.start);
+      const end = moment.unix(event.end);
+      return `${start.format('LT')} – ${end.format('LT')}`;
     }
-    const start = moment.unix(event.start);
-    const end = moment.unix(event.end);
-    return `${start.format('LT')} – ${end.format('LT')}`;
+    return localized('All day');
   }
 
   _renderDayHeader(day: Moment) {
@@ -150,18 +155,24 @@ export class AgendaView extends React.Component<MailspringCalendarViewProps, Age
    */
   _onAgendaEventDoubleClick = (e: React.MouseEvent, event: EventOccurrence) => {
     const eventEl = e.currentTarget as HTMLElement;
-    Actions.openPopover(<CalendarEventPopover event={event} />, {
-      originRect: eventEl.getBoundingClientRect(),
-      direction: 'right',
-      fallbackDirection: 'left',
-      closeOnAppBlur: false,
-    });
+    Actions.openPopover(
+      <CalendarEventPopover
+        event={event}
+        isCalendarReadOnly={this.props.isCalendarReadOnly(event.calendarId)}
+      />,
+      {
+        originRect: eventEl.getBoundingClientRect(),
+        direction: 'right',
+        fallbackDirection: 'left',
+        closeOnAppBlur: false,
+      }
+    );
   };
 
   _renderEvent(event: EventOccurrence, dayKey: string) {
     const colors = calcEventColors(event.calendarId);
     const meetingDomain = extractMeetingDomain(event.location, event.description);
-    const isSelected = this.props.selectedEvents.some((e) => e.id === event.id);
+    const isSelected = isEventSelected(this.props.selectedEvents, event);
 
     // Use a day-unique id/key so multi-day events don't produce duplicate DOM ids
     const uniqueId = `${event.id}-${dayKey}`;

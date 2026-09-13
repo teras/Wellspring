@@ -2,7 +2,7 @@
   "name": "wellspring",
   "productName": "Wellspring",
   "desktopName": "wellspring.desktop",
-  "version": "1.23.0",
+  "version": "1.24.0",
   "repository": {
     "type": "git",
     "url": "git://github.com/foundry376/mailspring.git"
@@ -71,20 +71,20 @@
     "underscore.string": "^3.3.5",
     "vcf": "^2.0.5",
     "windows-iana": "^4.2.1",
+    "xdg-portal": "^1.2.0",
     "xml2js": "^0.6.2"
   },
-  "resolutions": {
-    "electron": "41.7.2",
+  "overrides": {
+    "electron": "44.3.0",
     "@types/react": "^17.0.0",
     "@types/react-dom": "^17.0.0"
   },
-  "overrides": {},
   "optionalDependencies": {
     "windows-focus-assist": "^1.4.0"
   },
   "allowScripts": {
-    "better-sqlite3@12.8.0": true,
-    "electron@41.5.1": true,
+    "better-sqlite3@12.11.1": true,
+    "electron@44.3.0": true,
     "es5-ext@0.10.64": true,
     "windows-focus-assist@1.4.0": true
   }

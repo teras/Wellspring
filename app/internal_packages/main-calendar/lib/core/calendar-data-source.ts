@@ -4,6 +4,8 @@ import {
   Matcher,
   DatabaseStore,
   CalendarUtils,
+  CalendarDateUtils,
+  CalendarDate,
   ICSEventHelpers,
   AndCompositeMatcher,
   OrCompositeMatcher,
@@ -24,16 +26,107 @@ export interface EventAttendee {
   partstat?: ParticipationStatus;
 }
 
-export interface EventOccurrence {
-  start: number; // unix
-  end: number; // unix
+type ICAL = typeof import('ical.js').default;
+type ICALEvent = InstanceType<ICAL['Event']>;
+type ICALTime = InstanceType<ICAL['Time']>;
+
+/** An ICAL.Time's date, taken from its parts so no timezone is applied on the way. */
+function dateFromICALTime(time: ICALTime): CalendarDate {
+  return CalendarDateUtils.calendarDateFromParts(time.year, time.month, time.day);
+}
+
+/** Whether an occurrence covers the given day. */
+export function eventCoversDate(event: EventOccurrence, date: CalendarDate): boolean {
+  return event.startDate <= date && date <= event.endDate;
+}
+
+/**
+ * Whether an occurrence is in the selection, compared by id. Selection holds occurrences captured
+ * at click time; a data refresh gives every occurrence a fresh object identity, so an identity
+ * (`includes`) check silently drops the highlight on the next render.
+ */
+export function isEventSelected(
+  selectedEvents: EventOccurrence[],
+  event: EventOccurrence
+): boolean {
+  return selectedEvents.some((e) => e.id === event.id);
+}
+
+/**
+ * Narrowing guard. The app tsconfig omits `strictNullChecks`, so `if (e.isAllDay)` does NOT
+ * narrow the union — only `=== true`/`=== false` and a guard like this do. Use it to reach
+ * `start`/`end`, which exist on timed occurrences only.
+ */
+export function isTimed(e: EventOccurrence): e is TimedOccurrence {
+  return e.isAllDay === false;
+}
+
+/**
+ * An occurrence's start as an instant — its real start if timed, its first day's start if
+ * all-day. For sort keys, the focus scroll target, and day-snap drag references; never stored.
+ */
+export function occurrenceStartUnix(e: EventOccurrence): number {
+  return isTimed(e) ? e.start : CalendarDateUtils.dayStartUnix(e.startDate);
+}
+
+/**
+ * An occurrence's end as an exclusive instant — its real end if timed, the midnight after its
+ * last covered day if all-day. For drag hit-testing and time formatting; never stored, and not
+ * for layout positioning (that stays in date space).
+ */
+export function occurrenceEndUnix(e: EventOccurrence): number {
+  return isTimed(e) ? e.end : CalendarDateUtils.nextDayStartUnix(e.endDate);
+}
+
+/**
+ * The dates an event covers, inclusive, from its start and exclusive end instants.
+ *
+ * All-day ends land on a day boundary, so the last covered date is one date back; timed ends
+ * are instants, so step inside the end before reading it — a 22:00-00:00 event covers one day,
+ * not two. For events with parsed ICS, read the DATE parts instead; this is for callers that
+ * only hold instants.
+ */
+export function coveredDates(
+  startUnix: number,
+  endUnix: number,
+  isAllDay: boolean
+): { startDate: CalendarDate; endDate: CalendarDate } {
+  const startDate = CalendarDateUtils.calendarDateFromUnix(startUnix);
+  const endDate = isAllDay
+    ? CalendarDateUtils.addCalendarDays(CalendarDateUtils.calendarDateFromUnix(endUnix), -1)
+    : CalendarDateUtils.calendarDateFromUnix(Math.max(endUnix - 1, startUnix));
+  return { startDate, endDate: endDate > startDate ? endDate : startDate };
+}
+
+/**
+ * The last day an all-day span covers, given an exclusive end date.
+ *
+ * Subtracted in date space rather than by a second. For ends parsed from ICS the two agree,
+ * since ical.js hands back an exact midnight — but the expansion-failure path reads the
+ * denormalized columns, which the sync engine writes an hour late for any date inside DST.
+ * There `dateOf(end - 1s)` lands a day late and this doesn't. Floored at the start so a
+ * malformed span can't end before it begins.
+ */
+function lastCoveredDate(exclusiveEnd: CalendarDate, startDate: CalendarDate): CalendarDate {
+  return Math.max(CalendarDateUtils.addCalendarDays(exclusiveEnd, -1), startDate) as CalendarDate;
+}
+
+/** Fields common to all occurrences, all-day or timed. */
+interface OccurrenceBase {
+  /**
+   * The days covered, inclusive both ends — a one-day event has `startDate === endDate`.
+   *
+   * The authoritative span for all-day events, and what the day-cell filters read per event
+   * per cell via eventCoversDate.
+   */
+  startDate: CalendarDate;
+  endDate: CalendarDate;
   id: string;
   accountId: string;
   calendarId: string;
   title: string;
   location: string;
   description: string;
-  isAllDay: boolean;
   isCancelled: boolean;
   /**
    * True if this event should display with "pending" styling (hatched pattern).
@@ -61,8 +154,27 @@ export interface EventOccurrence {
   originalEventId?: string;
 }
 
+/** An all-day occurrence: covered dates only, no instants. `isAllDay` discriminates the union. */
+export interface AllDayOccurrence extends OccurrenceBase {
+  isAllDay: true;
+}
+
+/** A timed occurrence: keeps its start/end instants. */
+export interface TimedOccurrence extends OccurrenceBase {
+  isAllDay: false;
+  start: number; // unix
+  end: number; // unix
+}
+
+export type EventOccurrence = AllDayOccurrence | TimedOccurrence;
+
 // Minimal type for focusing/highlighting an event on the calendar
-export type FocusedEventInfo = Pick<EventOccurrence, 'start' | 'id'>;
+/**
+ * What the calendar keeps to hold an event focused: its id and a scroll-to instant. `start`
+ * is that instant — a timed event's real start, an all-day event's day start — so an all-day
+ * occurrence (which has no start of its own) still scrolls the view somewhere sensible.
+ */
+export type FocusedEventInfo = { id: string; start: number };
 
 /** Strip mailto: prefix from email addresses (common in iCalendar data) */
 function normalizeEmail(email: string): string {
@@ -102,6 +214,72 @@ export class CalendarDataSource {
   }
 }
 
+/**
+ * `startTime`/`endTime` are separate from `item` because an expanded occurrence's times differ
+ * from the component its properties come from.
+ */
+function occurrenceFromICS(args: {
+  id: string;
+  event: Event;
+  item: ICALEvent;
+  startTime: ICALTime;
+  endTime: ICALTime;
+  isRecurring: boolean;
+  /** Defaults to whether the component carries a RECURRENCE-ID */
+  isException?: boolean;
+}): EventOccurrence {
+  const { id, event, item, startTime, endTime } = args;
+  const startUnix = startTime.toJSDate().getTime() / 1000;
+  const endUnix = endTime.toJSDate().getTime() / 1000;
+
+  const statusValue = item.component?.getFirstPropertyValue('status');
+  const status = (typeof statusValue === 'string' ? statusValue : '').toUpperCase();
+
+  const attendees: EventAttendee[] = item.attendees.map((a) => ({
+    email: normalizeEmail(String(a.getFirstValue() || '')),
+    name: a.getFirstParameter('cn') || '',
+    partstat: (a.getFirstParameter('partstat') || 'NEEDS-ACTION') as ParticipationStatus,
+  }));
+
+  // Pending styling also covers an event I'm invited to but haven't answered
+  const myAttendee = attendees.find((a) => a.email && new Contact({ email: a.email }).isMe());
+  const myPartstat = myAttendee?.partstat?.toUpperCase();
+  const isAwaitingMyResponse = myAttendee && myPartstat !== 'ACCEPTED' && myPartstat !== 'DECLINED';
+
+  const isAllDay = !!startTime.isDate;
+  const startDate = isAllDay
+    ? dateFromICALTime(startTime)
+    : CalendarDateUtils.calendarDateFromUnix(startUnix);
+  const endDate = isAllDay
+    ? lastCoveredDate(dateFromICALTime(endTime), startDate)
+    : // the end instant is exclusive, so step inside it before reading the date
+      CalendarDateUtils.calendarDateFromUnix(Math.max(endUnix - 1, startUnix));
+
+  const rid = item.component?.getFirstPropertyValue('recurrence-id');
+
+  const base: OccurrenceBase = {
+    id,
+    accountId: event.accountId,
+    calendarId: event.calendarId,
+    title: item.summary || '',
+    location: item.location || '',
+    description: item.description || '',
+    startDate,
+    endDate,
+    isCancelled: status === 'CANCELLED',
+    isPending: status === 'TENTATIVE' || !!isAwaitingMyResponse,
+    isException: args.isException ?? !!rid,
+    recurrenceIdStart: rid ? (rid as any).toJSDate().getTime() / 1000 : undefined,
+    isRecurring: args.isRecurring,
+    organizer: item.organizer ? { email: item.organizer } : null,
+    attendees,
+  };
+
+  return isAllDay
+    ? { ...base, isAllDay: true }
+    : { ...base, isAllDay: false, start: startUnix, end: endUnix };
+}
+
 export function occurrencesForEvents(
   results: Event[],
   { startUnix, endUnix }: { startUnix: number; endUnix: number }
@@ -131,81 +309,87 @@ export function occurrencesForEvents(
     // Expand the master event's ICS (handles exceptions in same ICS file)
     if (master) {
       try {
-        const icalExpander = new IcalExpander({ ics: master.ics, maxIterations: 100 });
+        // The budget is derived from the series' own frequency rather than fixed. It was
+        // 100, which is not a limit on work but on how far back a series may begin: a
+        // weekly meeting older than about two years never reached the present, so it
+        // expanded to nothing and vanished from the calendar entirely.
+        const icalExpander = new IcalExpander({
+          ics: master.ics,
+          maxIterations: ICSEventHelpers.expansionIterationBudget(
+            master.ics,
+            master.recurrenceStart,
+            endUnix
+          ),
+        });
         const expanded = icalExpander.between(new Date(startUnix * 1000), new Date(endUnix * 1000));
 
         const masterIsRecurring = ICSEventHelpers.isRecurringEvent(master.ics);
 
-        [...expanded.events, ...expanded.occurrences].forEach((e, idx) => {
+        [...expanded.events, ...expanded.occurrences].forEach((e) => {
           const start = e.startDate.toJSDate().getTime() / 1000;
           const end = e.endDate.toJSDate().getTime() / 1000;
           // For occurrences, the actual event data is in e.item; for events, e is the event itself
           const item = 'item' in e ? e.item : e;
-          const statusValue = item.component?.getFirstPropertyValue('status');
-          const status = typeof statusValue === 'string' ? statusValue : '';
-
           expandedStartTimes.add(start);
 
-          // Parse attendees with their participation status
-          const attendees: EventAttendee[] = item.attendees.map((a) => ({
-            email: normalizeEmail(String(a.getFirstValue() || '')),
-            name: a.getFirstParameter('cn') || '',
-            partstat: (a.getFirstParameter('partstat') || 'NEEDS-ACTION') as ParticipationStatus,
-          }));
-
-          // Determine if event should show "pending" styling:
-          // 1. Event status is TENTATIVE, or
-          // 2. Current user is an attendee who hasn't accepted
-          const isTentativeStatus = status.toUpperCase() === 'TENTATIVE';
-          const myAttendee = attendees.find(
-            (a) => a.email && new Contact({ email: a.email }).isMe()
+          occurrences.push(
+            occurrenceFromICS({
+              // Key on the occurrence start, not the expansion index: idx depends on the query
+              // range, so the same occurrence got a different id per view — breaking selection
+              // (and React keys) when switching views. The start is stable across ranges.
+              id: `${master.id}-e${Math.round(start)}`,
+              event: master,
+              item,
+              startTime: e.startDate,
+              endTime: e.endDate,
+              isRecurring: masterIsRecurring,
+            })
           );
-          const myPartstat = myAttendee?.partstat?.toUpperCase();
-          const isAwaitingMyResponse =
-            myAttendee && myPartstat !== 'ACCEPTED' && myPartstat !== 'DECLINED';
-
-          occurrences.push({
-            start,
-            end,
-            id: `${master.id}-e${idx}`,
-            accountId: master.accountId,
-            calendarId: master.calendarId,
-            title: item.summary || '',
-            location: item.location || '',
-            description: item.description || '',
-            isAllDay: end - start >= 86400 - 1,
-            isCancelled: status.toUpperCase() === 'CANCELLED',
-            isPending: isTentativeStatus || isAwaitingMyResponse,
-            isException: !!item.component?.getFirstPropertyValue('recurrence-id'),
-            recurrenceIdStart: (() => {
-              const rid = item.component?.getFirstPropertyValue('recurrence-id');
-              return rid ? (rid as any).toJSDate().getTime() / 1000 : undefined;
-            })(),
-            isRecurring: masterIsRecurring,
-            organizer: item.organizer ? { email: item.organizer } : null,
-            attendees,
-          });
         });
       } catch (err) {
         console.error(`Failed to expand ICS for event ${master.id}:`, err);
-        // Fallback: show the master event as a single occurrence so it doesn't vanish
-        occurrences.push({
-          start: master.recurrenceStart,
-          end: master.recurrenceEnd,
-          id: `${master.id}-e0`,
-          accountId: master.accountId,
-          calendarId: master.calendarId,
-          title: '(Error expanding event)',
-          location: '',
-          description: '',
-          isAllDay: master.recurrenceEnd - master.recurrenceStart >= 86400 - 1,
-          isCancelled: false,
-          isPending: false,
-          isException: false,
-          isRecurring: false,
-          organizer: null,
-          attendees: [],
-        });
+        // Fallback: show the master event as a single occurrence so it doesn't vanish.
+        // Push it only when rs/re are finite — null/non-finite derive to NaN or 1970 dates
+        // that render nowhere. Guard the push, not the iteration: a bad master must still
+        // fall through to this UID's standalone exceptions below.
+        if (Number.isFinite(master.recurrenceStart) && Number.isFinite(master.recurrenceEnd)) {
+          const isAllDay = master.recurrenceEnd - master.recurrenceStart >= 82800;
+          const { startDate, endDate } = coveredDates(
+            master.recurrenceStart,
+            master.recurrenceEnd,
+            isAllDay
+          );
+
+          // Expansion failed, so there's no DATE flag to read — isAllDay fell back on
+          // duration above. A recurring master's columns can hold one occurrence's span, so
+          // a series can misread as all-day here.
+          const errorBase: OccurrenceBase = {
+            id: `${master.id}-e0`,
+            accountId: master.accountId,
+            calendarId: master.calendarId,
+            title: '(Error expanding event)',
+            location: '',
+            description: '',
+            startDate,
+            endDate,
+            isCancelled: false,
+            isPending: false,
+            isException: false,
+            isRecurring: false,
+            organizer: null,
+            attendees: [],
+          };
+          occurrences.push(
+            isAllDay
+              ? { ...errorBase, isAllDay: true }
+              : {
+                  ...errorBase,
+                  isAllDay: false,
+                  start: master.recurrenceStart,
+                  end: master.recurrenceEnd,
+                }
+          );
+        }
       }
     }
 
@@ -230,44 +414,17 @@ export function occurrencesForEvents(
           continue;
         }
 
-        const vevent = icsEvent.component;
-        const statusValue = vevent?.getFirstPropertyValue('status');
-        const status = typeof statusValue === 'string' ? statusValue : '';
-
-        // Parse attendees with their participation status
-        const attendees: EventAttendee[] = icsEvent.attendees.map((a) => ({
-          email: normalizeEmail(String(a.getFirstValue() || '')),
-          name: a.getFirstParameter('cn') || '',
-          partstat: (a.getFirstParameter('partstat') || 'NEEDS-ACTION') as ParticipationStatus,
-        }));
-
-        // Determine if event should show "pending" styling
-        const isTentativeStatus = status.toUpperCase() === 'TENTATIVE';
-        const myAttendee = attendees.find((a) => a.email && new Contact({ email: a.email }).isMe());
-        const myPartstat = myAttendee?.partstat?.toUpperCase();
-        const isAwaitingMyResponse =
-          myAttendee && myPartstat !== 'ACCEPTED' && myPartstat !== 'DECLINED';
-
-        const ridValue = vevent?.getFirstPropertyValue('recurrence-id');
-
-        occurrences.push({
-          start: occStart,
-          end: occEnd,
-          id: `${exception.id}-e0`,
-          accountId: exception.accountId,
-          calendarId: exception.calendarId,
-          title: icsEvent.summary || '',
-          location: icsEvent.location || '',
-          description: icsEvent.description || '',
-          isAllDay: occEnd - occStart >= 86400 - 1,
-          isCancelled: status.toUpperCase() === 'CANCELLED',
-          isPending: isTentativeStatus || isAwaitingMyResponse,
-          isException: true,
-          recurrenceIdStart: ridValue ? (ridValue as any).toJSDate().getTime() / 1000 : undefined,
-          isRecurring: true, // Exceptions are always from recurring series
-          organizer: icsEvent.organizer ? { email: icsEvent.organizer } : null,
-          attendees,
-        });
+        occurrences.push(
+          occurrenceFromICS({
+            id: `${exception.id}-e0`,
+            event: exception,
+            item: icsEvent,
+            startTime: icsEvent.startDate,
+            endTime: icsEvent.endDate,
+            isRecurring: true, // exceptions only exist for a series
+            isException: true,
+          })
+        );
       } catch (err) {
         console.error(`Failed to parse ICS for exception ${exception.id}:`, err);
       }

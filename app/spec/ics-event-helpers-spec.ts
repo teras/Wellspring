@@ -1,3 +1,4 @@
+import ICAL from 'ical.js';
 import * as ICSEventHelpers from '../src/ics-event-helpers';
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,33 @@ function getPropertyValue(ics: string, propName: string): string | null {
   const match = new RegExp(`^${propName.toUpperCase()}[;:](.+)$`, 'im').exec(ics);
   return match ? match[1].trim() : null;
 }
+
+describe('ICSEventHelpers.createICSString invitations', function () {
+  it('creates valid organizer and attendee properties for a meeting invitation', function () {
+    const ics = ICSEventHelpers.createICSString({
+      uid: 'meeting-invite@test',
+      summary: 'Planning meeting',
+      start: new Date('2026-08-17T15:00:00.000Z'),
+      end: new Date('2026-08-17T16:00:00.000Z'),
+      timezone: 'America/Chicago',
+      organizer: { email: 'organizer@example.com', name: 'Organizer' },
+      attendees: [{ email: 'attendee@example.com', name: 'Attendee' }],
+    });
+
+    const root = new ICAL.Component(ICAL.parse(ics));
+    const event = root.getFirstSubcomponent('vevent');
+    const organizer = event.getFirstProperty('organizer');
+    const attendee = event.getFirstProperty('attendee');
+
+    expect(organizer.getFirstValue()).toBe('mailto:organizer@example.com');
+    expect(organizer.getParameter('cn')).toBe('Organizer');
+    expect(attendee.getFirstValue()).toBe('mailto:attendee@example.com');
+    expect(attendee.getParameter('cn')).toBe('Attendee');
+    expect(attendee.getParameter('partstat')).toBe('NEEDS-ACTION');
+    expect(attendee.getParameter('role')).toBe('REQ-PARTICIPANT');
+    expect(attendee.getParameter('rsvp')).toBe('TRUE');
+  });
+});
 
 // Recurring event whose existing exception uses RECURRENCE-ID in *TZID format*
 // (e.g., produced by a CalDAV server or an older code path).
@@ -516,6 +544,66 @@ describe('ICSEventHelpers.shiftInlineExceptions', function () {
     expect(result).toBe(masterIcsWithException);
   });
 
+  describe('with a DATE-valued RECURRENCE-ID', function () {
+    // A daily all-day series with one inline exception on the 15th
+    const ALLDAY_WITH_EXCEPTION = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'BEGIN:VEVENT',
+      'UID:allday-series',
+      'SUMMARY:Standup',
+      'DTSTART;VALUE=DATE:20260310',
+      'DTEND;VALUE=DATE:20260311',
+      'RRULE:FREQ=DAILY',
+      'END:VEVENT',
+      'BEGIN:VEVENT',
+      'UID:allday-series',
+      'SUMMARY:Standup (moved)',
+      'RECURRENCE-ID;VALUE=DATE:20260315',
+      'DTSTART;VALUE=DATE:20260318',
+      'DTEND;VALUE=DATE:20260319',
+      'END:VEVENT',
+      'END:VCALENDAR',
+    ].join('\r\n');
+
+    const HOUR_MS = 3600000;
+
+    // The master shifts by whole calendar days, so the RECURRENCE-ID must too. Adding a
+    // 23h delta to a date would land inside the same day and detach the exception.
+    it('moves a whole day on a 23-hour (spring-forward) delta', function () {
+      const shifted = ICSEventHelpers.shiftInlineExceptions(ALLDAY_WITH_EXCEPTION, 23 * HOUR_MS);
+      expect(shifted).toContain('RECURRENCE-ID;VALUE=DATE:20260316');
+      expect(shifted).not.toContain('RECURRENCE-ID;VALUE=DATE:20260315');
+    });
+
+    // Passes with a raw ms delta too — 25h lands on the right day before truncation. Kept
+    // as a boundary case, not as a guard; only the 23-hour test above discriminates.
+    it('moves a whole day on a 25-hour delta', function () {
+      const shifted = ICSEventHelpers.shiftInlineExceptions(ALLDAY_WITH_EXCEPTION, 25 * HOUR_MS);
+      expect(shifted).toContain('RECURRENCE-ID;VALUE=DATE:20260316');
+    });
+
+    it('moves a whole day on an exact 24-hour delta (true under either arithmetic)', function () {
+      const shifted = ICSEventHelpers.shiftInlineExceptions(ALLDAY_WITH_EXCEPTION, 24 * HOUR_MS);
+      expect(shifted).toContain('RECURRENCE-ID;VALUE=DATE:20260316');
+    });
+
+    it('moves backward a whole day on a negative 23-hour delta', function () {
+      const shifted = ICSEventHelpers.shiftInlineExceptions(ALLDAY_WITH_EXCEPTION, -23 * HOUR_MS);
+      expect(shifted).toContain('RECURRENCE-ID;VALUE=DATE:20260314');
+    });
+
+    it('keeps the RECURRENCE-ID DATE-typed rather than adding a time', function () {
+      const shifted = ICSEventHelpers.shiftInlineExceptions(ALLDAY_WITH_EXCEPTION, 23 * HOUR_MS);
+      expect(shifted).not.toMatch(/RECURRENCE-ID(?!;VALUE=DATE)/);
+    });
+
+    it("leaves the exception's own DTSTART alone", function () {
+      const shifted = ICSEventHelpers.shiftInlineExceptions(ALLDAY_WITH_EXCEPTION, 23 * HOUR_MS);
+      expect(shifted).toContain('DTSTART;VALUE=DATE:20260318');
+    });
+  });
+
   it('shifts the RECURRENCE-ID forward by the given delta', function () {
     // Shift forward 1 day = 86400000 ms
     const shifted = ICSEventHelpers.shiftInlineExceptions(masterIcsWithException, 86400000);
@@ -694,6 +782,150 @@ describe('ICSEventHelpers.updateRecurringEventTimes', function () {
     // Master DTSTART was 20260301T060000Z → -2h → 20260301T040000Z
     expect(result).toContain('20260301T040000Z');
   });
+
+  it('applies a resize to the whole series (extends the master duration)', function () {
+    // Resize the 2nd occurrence from 1h to 2h: start unchanged, end +1h. Before the fix newEnd
+    // was ignored and the master stayed 1h (07:00); now it becomes 2h (08:00).
+    const T_RESIZE_END = Date.UTC(2026, 2, 2, 8, 0, 0) / 1000; // 20260302T080000Z (2h span)
+    const result = ICSEventHelpers.updateRecurringEventTimes(
+      DAILY_STANDUP_ICS,
+      T_OCC2_START,
+      T_OCC2_START, // no move
+      T_RESIZE_END,
+      false
+    );
+    expect(result).toContain('20260301T060000Z'); // DTSTART unchanged
+    expect(result).toContain('20260301T080000Z'); // DTEND now 2h after start
+    expect(result).not.toContain('20260301T070000Z'); // old 1h end gone
+  });
+
+  it('applies a combined move and resize', function () {
+    // Move +2h AND resize to 3h: newStart 08:00, newEnd 11:00.
+    const T_MR_START = Date.UTC(2026, 2, 2, 8, 0, 0) / 1000;
+    const T_MR_END = Date.UTC(2026, 2, 2, 11, 0, 0) / 1000;
+    const result = ICSEventHelpers.updateRecurringEventTimes(
+      DAILY_STANDUP_ICS,
+      T_OCC2_START,
+      T_MR_START,
+      T_MR_END,
+      false
+    );
+    expect(result).toContain('20260301T080000Z'); // DTSTART shifted +2h
+    expect(result).toContain('20260301T110000Z'); // DTEND = new start + 3h
+  });
+
+  // These pin the calendar-day SEMANTICS (whole-day moves, exclusive DTEND, month rollover)
+  // but not the DST behaviour: this module does plain-Date local arithmetic, which
+  // moment.tz.setDefault cannot redirect, and in CI's UTC a whole-day shift is exactly
+  // 86400s either way. Verified by hand across Chicago/Santiago/Havana/Beirut instead.
+  describe('for an all-day series', function () {
+    // A yearly all-day holiday. DTEND is exclusive, so 21st→22nd is a single day.
+    const YEARLY_ALLDAY_ICS = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'BEGIN:VEVENT',
+      'UID:holiday-1',
+      'SUMMARY:Midsummer',
+      'DTSTART;VALUE=DATE:20260621',
+      'DTEND;VALUE=DATE:20260622',
+      'RRULE:FREQ=YEARLY',
+      'END:VEVENT',
+      'END:VCALENDAR',
+    ].join('\r\n');
+
+    // All-day occurrence times are local midnights, the way the calendar produces them
+    const localMidnight = (y: number, m: number, d: number) =>
+      new Date(y, m - 1, d).getTime() / 1000;
+
+    it('moves the master forward by whole days, keeping DATE values', function () {
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        YEARLY_ALLDAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 22),
+        localMidnight(2026, 6, 23),
+        true
+      );
+      expect(result).toContain('DTSTART;VALUE=DATE:20260622');
+      expect(result).toContain('DTEND;VALUE=DATE:20260623');
+    });
+
+    it('moves the master backward by whole days', function () {
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        YEARLY_ALLDAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 19),
+        localMidnight(2026, 6, 20),
+        true
+      );
+      expect(result).toContain('DTSTART;VALUE=DATE:20260619');
+      expect(result).toContain('DTEND;VALUE=DATE:20260620');
+    });
+
+    it('leaves a zero-day move alone rather than drifting the dates', function () {
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        YEARLY_ALLDAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 22),
+        true
+      );
+      expect(result).toContain('DTSTART;VALUE=DATE:20260621');
+      expect(result).toContain('DTEND;VALUE=DATE:20260622');
+    });
+
+    it('resizes the series to a longer span', function () {
+      // Extend the 1-day holiday to 3 days (no move). Before the fix newEnd was ignored and it
+      // stayed 1 day; now the exclusive DTEND moves out to cover three days.
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        YEARLY_ALLDAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 21), // no move
+        localMidnight(2026, 6, 24), // 3-day span (exclusive end)
+        true
+      );
+      expect(result).toContain('DTSTART;VALUE=DATE:20260621');
+      expect(result).toContain('DTEND;VALUE=DATE:20260624');
+    });
+
+    it('carries the move across a month boundary', function () {
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        YEARLY_ALLDAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 7, 1),
+        localMidnight(2026, 7, 2),
+        true
+      );
+      expect(result).toContain('DTSTART;VALUE=DATE:20260701');
+      expect(result).toContain('DTEND;VALUE=DATE:20260702');
+    });
+
+    it('preserves the RRULE', function () {
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        YEARLY_ALLDAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 22),
+        localMidnight(2026, 6, 23),
+        true
+      );
+      expect(result).toContain('FREQ=YEARLY');
+    });
+
+    it('keeps a multi-day span the same length', function () {
+      const THREE_DAY_ICS = YEARLY_ALLDAY_ICS.replace(
+        'DTEND;VALUE=DATE:20260622',
+        'DTEND;VALUE=DATE:20260624'
+      );
+      const result = ICSEventHelpers.updateRecurringEventTimes(
+        THREE_DAY_ICS,
+        localMidnight(2026, 6, 21),
+        localMidnight(2026, 6, 28),
+        localMidnight(2026, 7, 1),
+        true
+      );
+      expect(result).toContain('DTSTART;VALUE=DATE:20260628');
+      expect(result).toContain('DTEND;VALUE=DATE:20260701');
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -707,5 +939,223 @@ describe('ICSEventHelpers.isRecurringEvent', function () {
 
   it('returns false for a simple (non-recurring) event', function () {
     expect(ICSEventHelpers.isRecurringEvent(SIMPLE_ICS)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// All-day DTEND is exclusive (RFC 5545): midnight of the day AFTER the last day
+// covered. Timestamps below are local midnights, because all-day times are built
+// from local date components — a UTC midnight would land on the previous day in
+// any negative-offset zone.
+// ---------------------------------------------------------------------------
+
+const ALL_DAY_SIMPLE_ICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:all-day-simple@test
+DTSTART;VALUE=DATE:20260622
+DTEND;VALUE=DATE:20260623
+SUMMARY:Company Holiday
+DTSTAMP:20260101T000000Z
+SEQUENCE:0
+END:VEVENT
+END:VCALENDAR`;
+
+/** Local midnight, as unix seconds */
+function localDay(year: number, month1Indexed: number, day: number): number {
+  return new Date(year, month1Indexed - 1, day).getTime() / 1000;
+}
+
+/** Extract the YYYYMMDD from a DATE-valued property */
+function getDateOnly(ics: string, propName: string): string | null {
+  const match = new RegExp(`^${propName.toUpperCase()}[^:]*:(\\d{8})\\s*$`, 'im').exec(ics);
+  return match ? match[1] : null;
+}
+
+describe('ICSEventHelpers.updateEventTimes with all-day events', function () {
+  it('keeps an already-exclusive end unchanged', function () {
+    const result = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 6, 22),
+      end: localDay(2026, 6, 23),
+      isAllDay: true,
+    });
+    expect(getDateOnly(result, 'DTSTART')).toBe('20260622');
+    expect(getDateOnly(result, 'DTEND')).toBe('20260623');
+  });
+
+  it('converts an inclusive end-of-day end to the next day', function () {
+    const result = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 6, 22),
+      end: localDay(2026, 6, 23) - 1, // 23:59:59 on the 22nd
+      isAllDay: true,
+    });
+    expect(getDateOnly(result, 'DTSTART')).toBe('20260622');
+    expect(getDateOnly(result, 'DTEND')).toBe('20260623');
+  });
+
+  it('gives a degenerate end (equal to start) a full day', function () {
+    const result = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 6, 22),
+      end: localDay(2026, 6, 22),
+      isAllDay: true,
+    });
+    expect(getDateOnly(result, 'DTEND')).toBe('20260623');
+  });
+
+  it('gives a same-day timed range a full day, as the popover all-day toggle produces', function () {
+    const result = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 6, 22) + 10 * 3600, // 10:00
+      end: localDay(2026, 6, 22) + 11 * 3600, // 11:00
+      isAllDay: true,
+    });
+    expect(getDateOnly(result, 'DTSTART')).toBe('20260622');
+    expect(getDateOnly(result, 'DTEND')).toBe('20260623');
+  });
+
+  it('preserves a multi-day span', function () {
+    const result = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 6, 20),
+      end: localDay(2026, 6, 23), // covers the 20th, 21st, 22nd
+      isAllDay: true,
+    });
+    expect(getDateOnly(result, 'DTSTART')).toBe('20260620');
+    expect(getDateOnly(result, 'DTEND')).toBe('20260623');
+  });
+
+  it('rolls over month and year boundaries', function () {
+    const endOfMonth = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 6, 30),
+      end: localDay(2026, 6, 30),
+      isAllDay: true,
+    });
+    expect(getDateOnly(endOfMonth, 'DTEND')).toBe('20260701');
+
+    const endOfYear = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+      start: localDay(2026, 12, 31),
+      end: localDay(2026, 12, 31),
+      isAllDay: true,
+    });
+    expect(getDateOnly(endOfYear, 'DTEND')).toBe('20270101');
+  });
+
+  it('never emits a zero-length all-day event', function () {
+    const ends = [
+      localDay(2026, 6, 22),
+      localDay(2026, 6, 22) + 1,
+      localDay(2026, 6, 23) - 1,
+      localDay(2026, 6, 23),
+    ];
+    ends.forEach((end) => {
+      const result = ICSEventHelpers.updateEventTimes(ALL_DAY_SIMPLE_ICS, {
+        start: localDay(2026, 6, 22),
+        end,
+        isAllDay: true,
+      });
+      const dtstart = getDateOnly(result, 'DTSTART');
+      const dtend = getDateOnly(result, 'DTEND');
+      // Assert both parsed, or a DATE-TIME regression on one side would pass
+      expect(dtstart).toBe('20260622');
+      expect(dtend).toBe('20260623');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Expansion budget. ical-expander iterates forward from DTSTART with no way to seek, so a
+// fixed cap is a limit on how far back a series may begin. At 100 a weekly meeting older
+// than about two years expanded to nothing and disappeared from the calendar.
+// ---------------------------------------------------------------------------
+
+describe('ICSEventHelpers.expansionIterationBudget', function () {
+  const series = (rrule: string, dtstart = '20220308T130000Z') =>
+    [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//Test//Test//EN',
+      // A VTIMEZONE first, with its own RRULEs - this is what a real Google calendar sends.
+      'BEGIN:VTIMEZONE',
+      'TZID:America/Indiana/Indianapolis',
+      'BEGIN:DAYLIGHT',
+      'TZOFFSETFROM:-0500',
+      'TZOFFSETTO:-0400',
+      'TZNAME:EDT',
+      'DTSTART:19700308T020000',
+      'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU',
+      'END:DAYLIGHT',
+      'END:VTIMEZONE',
+      'BEGIN:VEVENT',
+      'UID:series@test',
+      'DTSTAMP:20220308T000000Z',
+      `DTSTART:${dtstart}`,
+      'DTEND:20220308T132000Z',
+      `RRULE:${rrule}`,
+      'SUMMARY:Standup',
+      'END:VEVENT',
+      'END:VCALENDAR',
+    ].join('\r\n');
+
+  const START = Date.UTC(2022, 2, 8, 13, 0, 0) / 1000;
+  const NOW = Date.UTC(2026, 7, 28, 0, 0, 0) / 1000;
+
+  const budgetFor = (rrule: string, start: any = START, end: any = NOW) =>
+    ICSEventHelpers.expansionIterationBudget(series(rrule), start, end);
+
+  // A weekly series over this span needs 334 steps and a yearly one 105, both of which floor
+  // to MIN - so a weekly fixture cannot tell the VEVENT's rule from the VTIMEZONE's. Daily
+  // needs more than the floor, which is what makes these assertions discriminating.
+  const DAY = 86400;
+  const WEEK = 7 * DAY;
+  const FLOOR = 1000;
+
+  it("reads the event's RRULE, not the VTIMEZONE's DST rule", function () {
+    // The DAYLIGHT block's FREQ=YEARLY comes first in the file, so a plain search for the
+    // first RRULE reads it and derives 105 - indistinguishable from any other floored
+    // result. The event's own daily rule derives well above the floor.
+    const daily = budgetFor('FREQ=DAILY');
+    expect(daily).toBe(Math.ceil((NOW - START) / DAY) + 100);
+    expect(daily).toBeGreaterThan(FLOOR);
+    // Same file shape and dates, so the difference comes only from which rule was read.
+    expect(budgetFor('FREQ=YEARLY;BYMONTH=3')).toBe(FLOOR);
+  });
+
+  it('budgets enough steps to reach the end of the window', function () {
+    // The old fixed cap of 100 is about two years of weekly steps and stopped in early 2024.
+    expect(budgetFor('FREQ=WEEKLY;BYDAY=TU')).toBeGreaterThan(Math.ceil((NOW - START) / WEEK));
+    // Daily needs 1634, more than the floor supplies, so this asserts the derivation itself.
+    const daily = budgetFor('FREQ=DAILY');
+    expect(daily).toBeGreaterThan(Math.ceil((NOW - START) / DAY));
+    expect(daily).toBeGreaterThan(budgetFor('FREQ=WEEKLY;BYDAY=TU'));
+  });
+
+  it('returns the floor when the series has no usable start', function () {
+    // recurrenceStart can be null or non-finite. A NaN budget is worse than a small one:
+    // it survives Math.max/Math.min and ical-expander reads `!this.maxIterations` as no cap,
+    // so an abusive rule iterates unbounded instead of being truncated.
+    // Passed positionally rather than through budgetFor, whose defaults would swallow
+    // undefined and quietly test a finite start instead.
+    const abusive = series('FREQ=SECONDLY');
+    [null, undefined, NaN, Infinity, -Infinity].forEach((noStart) => {
+      expect(ICSEventHelpers.expansionIterationBudget(abusive, noStart as any, NOW)).toBe(FLOOR);
+    });
+    expect(ICSEventHelpers.expansionIterationBudget(series('FREQ=DAILY'), START, NaN)).toBe(FLOOR);
+  });
+
+  it('accounts for INTERVAL, which stretches how far each step reaches', function () {
+    expect(budgetFor('FREQ=DAILY')).toBeGreaterThan(budgetFor('FREQ=DAILY;INTERVAL=3'));
+  });
+
+  it('caps a frequency fine enough to be abusive rather than spinning', function () {
+    // An invitation is untrusted input; FREQ=SECONDLY dated years back would otherwise
+    // iterate essentially forever.
+    expect(budgetFor('FREQ=SECONDLY')).toBe(50000);
+  });
+
+  it('returns the floor for an event that does not recur at all', function () {
+    // Strip the VEVENT's own rule rather than the first RRULE in the file - that one belongs
+    // to the VTIMEZONE, and removing it leaves a weekly series that floors to the same value.
+    const ics = series('FREQ=WEEKLY').replace('\r\nRRULE:FREQ=WEEKLY', '');
+    expect(/BEGIN:VEVENT[\s\S]*RRULE:/.test(ics)).toBe(false);
+    expect(ICSEventHelpers.expansionIterationBudget(ics, START, NOW)).toBe(FLOOR);
   });
 });

@@ -71,6 +71,7 @@ export * from '../flux/tasks/change-labels-task';
 export * from '../flux/tasks/change-folder-task';
 export * from '../flux/tasks/change-unread-task';
 export * from '../flux/tasks/destroy-model-task';
+export * from '../flux/tasks/destroy-event-task';
 export * from '../flux/tasks/syncback-draft-task';
 export * from '../flux/tasks/change-starred-task';
 export * from '../flux/tasks/syncback-event-task';
@@ -190,6 +191,10 @@ export type CalendarUtils = typeof import('../calendar-utils');
 export const CalendarUtils: CalendarUtils;
 export { ICSParticipantStatus, ICSParticipant } from '../calendar-utils';
 
+export type CalendarDateUtils = typeof import('../calendar-date');
+export const CalendarDateUtils: CalendarDateUtils;
+export { CalendarDate } from '../calendar-date';
+
 export type ICSEventHelpers = typeof import('../ics-event-helpers');
 export const ICSEventHelpers: ICSEventHelpers;
 export {
@@ -203,6 +208,8 @@ export type FsUtils = typeof import('../fs-utils');
 export const FsUtils: FsUtils;
 export type CanvasUtils = typeof import('../canvas-utils');
 export const CanvasUtils: CanvasUtils;
+export type DragDropTypes = typeof import('../drag-drop-types');
+export const DragDropTypes: DragDropTypes;
 export type RegExpUtils = typeof import('../regexp-utils').default;
 export const RegExpUtils: RegExpUtils;
 export type MenuHelpers = typeof import('../menu-helpers');

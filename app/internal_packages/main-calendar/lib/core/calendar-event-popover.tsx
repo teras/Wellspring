@@ -12,6 +12,7 @@ import {
   ICSEventHelpers,
   CalendarUtils,
   SyncbackEventTask,
+  CalendarDateUtils,
 } from 'mailspring-exports';
 import {
   DatePicker,
@@ -21,9 +22,19 @@ import {
   TimePicker,
 } from 'mailspring-component-kit';
 import { EventAttendeesInput } from './event-attendees-input';
-import { EventOccurrence, EventAttendee } from './calendar-data-source';
+import {
+  EventOccurrence,
+  EventAttendee,
+  occurrenceStartUnix,
+  occurrenceEndUnix,
+} from './calendar-data-source';
 import { EventPropertyRow } from './event-property-row';
-import { createCalendarEvent } from './calendar-helpers';
+import {
+  createCalendarEvent,
+  inclusiveAllDayEnd,
+  shiftEndWithStart,
+  clampEnd,
+} from './calendar-helpers';
 // CalendarColorPicker import removed - disabled until custom event colors are fully supported
 import { CalendarSelector } from './calendar-selector';
 import { LocationVideoInput } from './location-video-input';
@@ -82,6 +93,8 @@ interface CalendarEventPopoverProps {
   accounts?: Account[];
   /** Disabled calendar IDs (required when isNewEvent is true) */
   disabledCalendars?: string[];
+  /** Whether the calendar containing this event is read-only */
+  isCalendarReadOnly?: boolean;
 }
 
 interface CalendarEventPopoverState {
@@ -115,7 +128,10 @@ export class CalendarEventPopover extends React.Component<
 
   constructor(props: CalendarEventPopoverProps) {
     super(props);
-    const { description, start, end, location, attendees, title, isAllDay } = this.props.event;
+    const { description, location, attendees, title, isAllDay } = this.props.event;
+    // The popover edits in instants; seed all-day events from their derived day boundaries.
+    const start = occurrenceStartUnix(this.props.event);
+    const end = occurrenceEndUnix(this.props.event);
 
     this.state = {
       description,
@@ -142,7 +158,9 @@ export class CalendarEventPopover extends React.Component<
   componentDidUpdate(prevProps: CalendarEventPopoverProps, prevState: CalendarEventPopoverState) {
     // Update state when event prop changes
     if (prevProps.event !== this.props.event) {
-      const { description, start, end, location, attendees, title } = this.props.event;
+      const { description, location, attendees, title } = this.props.event;
+      const start = occurrenceStartUnix(this.props.event);
+      const end = occurrenceEndUnix(this.props.event);
       this.setState({ description, start, end, location, attendees, title });
     }
 
@@ -207,46 +225,55 @@ export class CalendarEventPopover extends React.Component<
   }
 
   saveEdits = async (): Promise<void> => {
-    if (this.props.isNewEvent) {
-      await this._createNewEvent();
-      return;
-    }
-
-    // Extract the real event ID from the occurrence ID (format: `${eventId}-e${idx}`)
-    const eventId = parseEventIdFromOccurrence(this.props.event.id);
-
-    // Fetch the actual Event from the database
-    const event = await DatabaseStore.find<Event>(Event, eventId);
-    if (!event) {
-      console.error(`Could not find event with id ${eventId} to update`);
-      this.setState({ editing: false });
-      return;
-    }
-
-    const isRecurring =
-      ICSEventHelpers.isRecurringEvent(event.ics) && !event.isRecurrenceException();
-
-    if (this.props.event.isException) {
-      // This occurrence already has an exception — always edit the exception directly.
-      // The user already chose "this occurrence only" when the exception was created;
-      // asking again would be confusing and risks creating duplicate exception VEVENTs.
-      await this._saveOccurrenceException(event);
-    } else if (isRecurring) {
-      const choice = await showRecurringEventDialog('edit', this.props.event.title);
-      if (choice === 'cancel') {
+    try {
+      if (this.props.isNewEvent) {
+        await this._createNewEvent();
         return;
       }
-      if (choice === 'this-occurrence') {
+
+      // Extract the real event ID from the occurrence ID (format: `${eventId}-e${idx}`)
+      const eventId = parseEventIdFromOccurrence(this.props.event.id);
+
+      // Fetch the actual Event from the database
+      const event = await DatabaseStore.find<Event>(Event, eventId);
+      if (!event) {
+        console.error(`Could not find event with id ${eventId} to update`);
+        this.setState({ editing: false });
+        return;
+      }
+
+      const isRecurring =
+        ICSEventHelpers.isRecurringEvent(event.ics) && !event.isRecurrenceException();
+
+      if (this.props.event.isException) {
+        // This occurrence already has an exception — always edit the exception directly.
+        // The user already chose "this occurrence only" when the exception was created;
+        // asking again would be confusing and risks creating duplicate exception VEVENTs.
         await this._saveOccurrenceException(event);
+      } else if (isRecurring) {
+        const choice = await showRecurringEventDialog('edit', this.props.event.title);
+        if (choice === 'cancel') {
+          return;
+        }
+        if (choice === 'this-occurrence') {
+          await this._saveOccurrenceException(event);
+        } else {
+          this._saveAllOccurrences(event);
+        }
       } else {
         this._saveAllOccurrences(event);
       }
-    } else {
-      this._saveAllOccurrences(event);
-    }
 
-    this.setState({ editing: false });
-    Actions.closePopover();
+      this.setState({ editing: false });
+      Actions.closePopover();
+    } catch (error) {
+      // Stay in edit mode so a failed save doesn't discard what the user typed
+      console.error('Failed to save event edits:', error);
+      AppEnv.showErrorDialog({
+        title: localized('Update Failed'),
+        message: localized('Failed to update the event. Please try again.'),
+      });
+    }
   };
 
   /**
@@ -276,7 +303,7 @@ export class CalendarEventPopover extends React.Component<
       // the same delta to the master DTSTART. This preserves all occurrences relative
       // to the new master start (unlike absolute updateEventTimes which would drop
       // occurrences scheduled before the selected occurrence's date).
-      const originalOccurrenceStart = this.props.event.start;
+      const originalOccurrenceStart = occurrenceStartUnix(this.props.event);
       ics = ICSEventHelpers.updateRecurringEventTimes(
         ics,
         originalOccurrenceStart,
@@ -304,8 +331,13 @@ export class CalendarEventPopover extends React.Component<
     ics = ICSEventHelpers.updateRecurrenceRule(ics, rrule);
 
     event.ics = ics;
-    event.recurrenceStart = this.state.start;
-    event.recurrenceEnd = this.state.end;
+    // Re-derive the cached columns from the written ICS, not from state: for a recurring "all
+    // events" edit the master DTSTART/DTEND are shifted+resized and differ from the edited
+    // occurrence's times (matches modifyAllOccurrences). For a non-recurring edit this equals
+    // state anyway.
+    const { event: savedIcsEvent } = CalendarUtils.parseICSString(ics);
+    event.recurrenceStart = savedIcsEvent.startDate.toJSDate().getTime() / 1000;
+    event.recurrenceEnd = savedIcsEvent.endDate.toJSDate().getTime() / 1000;
 
     Actions.queueTask(
       SyncbackEventTask.forUpdating({
@@ -333,7 +365,8 @@ export class CalendarEventPopover extends React.Component<
     // recurrenceIdStart instead (the RECURRENCE-ID value = the original unmodified time).
     // This ensures the upsert in createRecurrenceException finds and replaces the existing
     // inline exception VEVENT rather than creating a duplicate.
-    const originalOccurrenceStart = this.props.event.recurrenceIdStart ?? this.props.event.start;
+    const originalOccurrenceStart =
+      this.props.event.recurrenceIdStart ?? occurrenceStartUnix(this.props.event);
 
     // Embed the exception VEVENT inline in the master VCALENDAR with new times
     const { masterIcs, recurrenceId } = ICSEventHelpers.createRecurrenceException(
@@ -415,6 +448,15 @@ export class CalendarEventPopover extends React.Component<
     this.setState({ [key]: value } as Pick<CalendarEventPopoverState, K>);
   };
 
+  updateStart = (start: number): void => {
+    const { start: oldStart, end, allDay } = this.state;
+    this.setState({ start, end: shiftEndWithStart(oldStart, end, start, allDay) });
+  };
+
+  updateEnd = (end: number): void => {
+    this.setState({ end: clampEnd(this.state.start, end, this.state.allDay) });
+  };
+
   renderEditable = () => {
     const {
       title,
@@ -480,25 +522,27 @@ export class CalendarEventPopover extends React.Component<
 
           {/* Start/End times using property rows */}
           <EventPropertyRow label={localized('starts:')}>
-            <DatePicker
-              value={start * 1000}
-              onChange={(ts) => this.updateField('start', ts / 1000)}
-            />
+            <DatePicker value={start * 1000} onChange={(ts) => this.updateStart(ts / 1000)} />
             {!allDay && (
-              <TimePicker
-                value={start * 1000}
-                onChange={(ts) => this.updateField('start', ts / 1000)}
-              />
+              <TimePicker value={start * 1000} onChange={(ts) => this.updateStart(ts / 1000)} />
             )}
           </EventPropertyRow>
 
           <EventPropertyRow label={localized('ends:')}>
-            <DatePicker value={end * 1000} onChange={(ts) => this.updateField('end', ts / 1000)} />
+            <DatePicker
+              value={(allDay ? inclusiveAllDayEnd(end) : end) * 1000}
+              onChange={(ts) =>
+                this.updateEnd(
+                  allDay
+                    ? CalendarDateUtils.nextDayStartUnix(
+                        CalendarDateUtils.calendarDateFromUnix(ts / 1000)
+                      )
+                    : ts / 1000
+                )
+              }
+            />
             {!allDay && (
-              <TimePicker
-                value={end * 1000}
-                onChange={(ts) => this.updateField('end', ts / 1000)}
-              />
+              <TimePicker value={end * 1000} onChange={(ts) => this.updateEnd(ts / 1000)} />
             )}
           </EventPropertyRow>
 
@@ -573,23 +617,37 @@ export class CalendarEventPopover extends React.Component<
   };
 
   render() {
-    if (this.state.editing || this.props.isNewEvent) {
+    if (!this.props.isCalendarReadOnly && (this.state.editing || this.props.isNewEvent)) {
       return this.renderEditable();
     }
     return <CalendarEventPopoverUnenditable {...this.props} onEdit={this.onEdit} />;
   }
 }
 
-class CalendarEventPopoverUnenditable extends React.Component<{
-  event: EventOccurrence;
-  onEdit: () => void;
-}> {
+class CalendarEventPopoverUnenditable extends React.Component<
+  CalendarEventPopoverProps & { onEdit: () => void }
+> {
   descriptionRef = React.createRef<HTMLDivElement>();
 
   renderTime() {
-    const startMoment = moment(this.props.event.start * 1000);
-    const endMoment = moment(this.props.event.end * 1000);
+    const { event } = this.props;
+
+    if (event.isAllDay === true) {
+      const startMoment = moment(CalendarDateUtils.dayStartUnix(event.startDate) * 1000);
+      const date = startMoment.format('dddd, MMMM D'); // e.g. Tuesday, February 22
+      const lastDay = moment(CalendarDateUtils.dayStartUnix(event.endDate) * 1000);
+      return (
+        <div>
+          {event.startDate === event.endDate ? date : `${date} – ${lastDay.format('MMMM D')}`}
+          <br />
+          {localized('All day')}
+        </div>
+      );
+    }
+
+    const startMoment = moment(event.start * 1000);
     const date = startMoment.format('dddd, MMMM D'); // e.g. Tuesday, February 22
+    const endMoment = moment(event.end * 1000);
     const timeRange = `${formatTime(startMoment)} - ${formatTime(endMoment)}`;
     return (
       <div>
@@ -617,7 +675,7 @@ class CalendarEventPopoverUnenditable extends React.Component<{
   }
 
   render() {
-    const { event, onEdit } = this.props;
+    const { event, onEdit, isCalendarReadOnly } = this.props;
     const { title, description, location, attendees } = event;
 
     const notes = extractNotesFromDescription(description);
@@ -626,13 +684,15 @@ class CalendarEventPopoverUnenditable extends React.Component<{
       <div className="calendar-event-popover" tabIndex={0}>
         <div className="title-wrapper">
           <div className="title">{title}</div>
-          <RetinaImg
-            className="edit-icon"
-            name="edit-icon.png"
-            title="Edit Item"
-            mode={RetinaImg.Mode.ContentIsMask}
-            onClick={onEdit}
-          />
+          {!isCalendarReadOnly && (
+            <RetinaImg
+              className="edit-icon"
+              name="edit-icon.png"
+              title="Edit Item"
+              mode={RetinaImg.Mode.ContentIsMask}
+              onClick={onEdit}
+            />
+          )}
         </div>
         {location && (
           <div className="location">

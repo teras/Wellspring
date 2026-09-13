@@ -1,7 +1,12 @@
 import React from 'react';
 import { Moment } from 'moment-timezone';
 import classnames from 'classnames';
-import { EventOccurrence, FocusedEventInfo } from './calendar-data-source';
+import {
+  EventOccurrence,
+  FocusedEventInfo,
+  occurrenceStartUnix,
+  isEventSelected,
+} from './calendar-data-source';
 import { MonthViewEvent } from './month-view-event';
 import { localized } from 'mailspring-exports';
 import { DragState, HitZone } from './calendar-drag-types';
@@ -22,8 +27,7 @@ interface MonthViewDayCellProps {
   onEventDragStart: (
     event: EventOccurrence,
     mouseEvent: React.MouseEvent,
-    hitZone: HitZone,
-    mouseTime: number
+    hitZone: HitZone
   ) => void;
   /** Set of calendar IDs that are read-only */
   readOnlyCalendarIds: Set<string>;
@@ -38,7 +42,7 @@ export class MonthViewDayCell extends React.Component<MonthViewDayCellProps> {
   };
 
   _isEventSelected(event: EventOccurrence): boolean {
-    return this.props.selectedEvents.some((e) => e.id === event.id);
+    return isEventSelected(this.props.selectedEvents, event);
   }
 
   _sortEvents(events: EventOccurrence[]): EventOccurrence[] {
@@ -49,7 +53,7 @@ export class MonthViewDayCell extends React.Component<MonthViewDayCellProps> {
       if (!a.isDragPreview && b.isDragPreview) return -1;
       if (a.isAllDay && !b.isAllDay) return -1;
       if (!a.isAllDay && b.isAllDay) return 1;
-      return a.start - b.start;
+      return occurrenceStartUnix(a) - occurrenceStartUnix(b);
     });
   }
 

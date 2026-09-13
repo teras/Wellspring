@@ -1,16 +1,28 @@
 import React, { CSSProperties } from 'react';
 import ReactDOM from 'react-dom';
 import { InjectedComponentSet } from 'mailspring-component-kit';
-import { EventOccurrence } from './calendar-data-source';
+import { CalendarDateUtils } from 'mailspring-exports';
+import {
+  EventOccurrence,
+  isTimed,
+  occurrenceStartUnix,
+  occurrenceEndUnix,
+} from './calendar-data-source';
 import { calcEventColors, extractMeetingDomain, formatEventTimeRange } from './calendar-helpers';
 import { RecurringIcon } from './calendar-icons';
 import { HitZone, ViewDirection } from './calendar-drag-types';
-import { detectHitZone, canDragEvent, formatDragPreviewTime } from './calendar-drag-utils';
+import { detectHitZone, canMoveEvent, formatDragPreviewTime } from './calendar-drag-utils';
+import { DAY_DUR, columnSpan } from './week-view-helpers';
 
 interface CalendarEventProps {
   event: EventOccurrence;
   order: number;
   selected: boolean;
+  /**
+   * The span this event is positioned within. Day columns pass one day, exclusive — its real
+   * length, not 86400. The all-day row passes the whole buffered week, and reads it only as a
+   * day count, so the two disagree by a second there without effect.
+   */
   scopeEnd: number;
   scopeStart: number;
   direction: 'horizontal' | 'vertical';
@@ -32,12 +44,7 @@ interface CalendarEventProps {
   onFocused: (event: EventOccurrence) => void;
 
   /** Called when a drag operation starts on this event */
-  onDragStart?: (
-    event: EventOccurrence,
-    mouseEvent: React.MouseEvent,
-    hitZone: HitZone,
-    mouseTime: number
-  ) => void;
+  onDragStart?: (event: EventOccurrence, mouseEvent: React.MouseEvent, hitZone: HitZone) => void;
 }
 
 interface CalendarEventState {
@@ -87,14 +94,27 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
   }
 
   _getDimensions() {
-    const scopeLen = this.props.scopeEnd - this.props.scopeStart;
-    const duration = this.props.event.end - this.props.event.start;
+    const event = this.props.event;
 
-    let top: number | string = Math.max(
-      (this.props.event.start - this.props.scopeStart) / scopeLen,
-      0
-    );
-    let height: number | string = Math.min((duration - this._overflowBefore()) / scopeLen, 1);
+    // Fractions of the scope: timed events by wall clock down a day column, all-day events by
+    // whole days across the week (remapped in _getStyles).
+    let top: number | string;
+    let height: number | string;
+    if (isTimed(event)) {
+      const span = columnSpan(event, { start: this.props.scopeStart, end: this.props.scopeEnd });
+      top = span.top / DAY_DUR;
+      height = (span.bottom - span.top) / DAY_DUR;
+    } else {
+      const scopeStartDate = CalendarDateUtils.calendarDateFromUnix(this.props.scopeStart);
+      const scopeDays = Math.round((this.props.scopeEnd - this.props.scopeStart) / 86400);
+      const startOffset = CalendarDateUtils.calendarDaysBetween(scopeStartDate, event.startDate);
+      const spanDays = CalendarDateUtils.calendarDaysBetween(event.startDate, event.endDate) + 1;
+      // Mirror the timed branch: clamp the start into scope and drop the pre-scope days from the
+      // span, so an all-day event beginning before the visible week isn't drawn too wide.
+      const overflowDays = Math.max(-startOffset, 0);
+      top = Math.max(startOffset / scopeDays, 0);
+      height = Math.min((spanDays - overflowDays) / scopeDays, 1);
+    }
 
     let width: number | string = 1;
     let left: number | string;
@@ -149,10 +169,6 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     return styles;
   }
 
-  _overflowBefore() {
-    return Math.max(this.props.scopeStart - this.props.event.start, 0);
-  }
-
   /**
    * Check if this event can be dragged
    */
@@ -162,7 +178,7 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
       return false;
     }
     return (
-      canDragEvent(this.props.event, this.props.isCalendarReadOnly) && !!this.props.onDragStart
+      canMoveEvent(this.props.event, this.props.isCalendarReadOnly) && !!this.props.onDragStart
     );
   }
 
@@ -199,29 +215,6 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
   };
 
   /**
-   * Calculate the time at the mouse position within this event's scope
-   */
-  _getMouseTime(e: React.MouseEvent<HTMLDivElement>): number {
-    const bounds = e.currentTarget.getBoundingClientRect();
-    const { scopeStart, scopeEnd, direction } = this.props;
-    const scopeLen = scopeEnd - scopeStart;
-
-    let percent: number;
-    if (direction === 'vertical') {
-      // Vertical layout: Y position determines time
-      percent = (e.clientY - bounds.top) / bounds.height;
-    } else {
-      // Horizontal layout: X position determines time
-      percent = (e.clientX - bounds.left) / bounds.width;
-    }
-
-    // Clamp to [0, 1] and calculate time
-    percent = Math.max(0, Math.min(1, percent));
-    const eventDuration = this.props.event.end - this.props.event.start;
-    return this.props.event.start + percent * eventDuration;
-  }
-
-  /**
    * Initiate drag on mouse down
    */
   _onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -237,12 +230,9 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     // Prevent text selection during drag
     e.preventDefault();
 
-    // Calculate the time at the click position within this event
-    const mouseTime = this._getMouseTime(e);
-
-    // Notify parent of drag start
+    // No time is passed: the container's hit-test supplies it as this mousedown bubbles.
     if (this.props.onDragStart) {
-      this.props.onDragStart(this.props.event, e, this.state.hitZone, mouseTime);
+      this.props.onDragStart(this.props.event, e, this.state.hitZone);
     }
   };
 
@@ -264,7 +254,11 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     if (!event.isDragPreview) {
       return null;
     }
-    const timeString = formatDragPreviewTime(event.start, event.end, event.isAllDay);
+    const timeString = formatDragPreviewTime(
+      occurrenceStartUnix(event),
+      occurrenceEndUnix(event),
+      event.isAllDay
+    );
     return <div className="drag-preview-time-tooltip">{timeString}</div>;
   }
 
@@ -282,7 +276,11 @@ export class CalendarEvent extends React.Component<CalendarEventProps, CalendarE
     }
 
     const meetingDomain = extractMeetingDomain(event.location, event.description);
-    const timeRange = formatEventTimeRange(event.start, event.end, event.isAllDay);
+    const timeRange = formatEventTimeRange(
+      occurrenceStartUnix(event),
+      occurrenceEndUnix(event),
+      event.isAllDay
+    );
     const hasPhysicalLocation = !meetingDomain && !!event.location;
 
     if (!meetingDomain && !hasPhysicalLocation && !timeRange) {

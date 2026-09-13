@@ -49,7 +49,7 @@
     "better-sqlite3": "^12.8.0",
     "chalk": "1.x.x",
     "devtron": "^1.4.0",
-    "electron": "41.7.2",
+    "electron": "44.3.0",
     "electron-playwright-helpers": "^2.1.0",
     "electron-winstaller": "5.4.0",
     "eslint": "^8.0.0",
@@ -78,15 +78,18 @@
     "lint": "eslint --fix -c .eslintrc \"app/src/**/*.{ts,tsx}\" \"app/internal_packages/**/*.{ts,tsx}\"",
     "lint:check": "eslint -c .eslintrc \"app/src/**/*.{ts,tsx}\" \"app/internal_packages/**/*.{ts,tsx}\"",
     "typecheck": "./node_modules/.bin/tsc -p app/tsconfig.json --noEmit",
-    "test": "electron ./app --enable-logging --test",
-    "test-window": "electron ./app --enable-logging --test=window",
+    "test": "node scripts/test.js --test",
+    "test-window": "node scripts/test.js --test=window",
     "test:e2e": "npx playwright test --config playwright/playwright.config.ts",
     "tsc-watch": "tsc -w -p ./app --noEmit",
     "build": "node app/build/build.js"
   },
+  "overrides": {
+    "tar": "7.5.21"
+  },
   "allowScripts": {
-    "electron@41.7.2": true,
-    "better-sqlite3@12.9.0": true,
+    "electron@44.3.0": true,
+    "better-sqlite3@12.11.1": true,
     "highlight.js@9.18.5": true,
     "electron-winstaller@5.4.0": true
   }

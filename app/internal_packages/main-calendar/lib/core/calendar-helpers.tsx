@@ -1,3 +1,4 @@
+import moment from 'moment';
 import {
   Utils,
   Calendar,
@@ -8,7 +9,11 @@ import {
   SyncbackEventTask,
   TaskQueue,
   localized,
+  CalendarDateUtils,
 } from 'mailspring-exports';
+import { MIN_EVENT_DURATION_SECONDS } from './calendar-constants';
+import { EventOccurrence, isTimed } from './calendar-data-source';
+import { dayFraction } from './week-view-helpers';
 
 // Cache of calendar colors synced from CalDAV servers
 const calendarColorCache: Map<string, string> = new Map();
@@ -256,6 +261,57 @@ export function extractMeetingDomain(location: string, description: string): str
 }
 
 /**
+ * All-day events store an exclusive end — midnight after the last day covered — so a
+ * date picker showing it raw reads a day later than the event actually runs.
+ * @returns The last day the event covers, at local midnight
+ */
+export function inclusiveAllDayEnd(end: number): number {
+  return moment
+    .unix(end - 1)
+    .startOf('day')
+    .unix();
+}
+
+/**
+ * The end an event should take when its start moves, preserving the duration.
+ * All-day events shift in whole days: a seconds delta across a DST transition would
+ * land the end off midnight and gain or lose a day once serialized.
+ * @returns The new end, as a unix timestamp
+ */
+export function shiftEndWithStart(
+  startUnix: number,
+  endUnix: number,
+  newStartUnix: number,
+  isAllDay: boolean
+): number {
+  if (!isAllDay) {
+    return endUnix + (newStartUnix - startUnix);
+  }
+  const days = CalendarDateUtils.calendarDaysBetween(
+    CalendarDateUtils.calendarDateFromUnix(startUnix),
+    CalendarDateUtils.calendarDateFromUnix(newStartUnix)
+  );
+  return CalendarDateUtils.nextDayStartUnix(
+    CalendarDateUtils.addCalendarDays(
+      CalendarDateUtils.calendarDateFromUnix(inclusiveAllDayEnd(endUnix)),
+      days
+    )
+  );
+}
+
+/**
+ * Clamp a proposed end so it can never precede the start — one whole day for an all-day
+ * event, MIN_EVENT_DURATION_SECONDS for a timed one.
+ * @returns The clamped end, as a unix timestamp
+ */
+export function clampEnd(startUnix: number, endUnix: number, isAllDay: boolean): number {
+  const floor = isAllDay
+    ? CalendarDateUtils.nextDayStartUnix(CalendarDateUtils.calendarDateFromUnix(startUnix))
+    : startUnix + MIN_EVENT_DURATION_SECONDS;
+  return Math.max(endUnix, floor);
+}
+
+/**
  * Format an event's time range for display (e.g., "12 – 1PM").
  * Only returns a string for events that are 1 hour or longer.
  * Returns null for shorter events or all-day events.
@@ -325,6 +381,15 @@ export function showNoEditableCalendarsError(): void {
 }
 
 /**
+ * Show an error dialog when the user tries to change events on a read-only calendar.
+ */
+export function showReadOnlyCalendarError(): void {
+  AppEnv.showErrorDialog(
+    localized("This calendar is read-only, so its events can't be changed or deleted.")
+  );
+}
+
+/**
  * Options for creating a new calendar event.
  */
 export interface CreateCalendarEventOptions {
@@ -383,4 +448,13 @@ export async function createCalendarEvent(options: CreateCalendarEventOptions): 
   } catch (error) {
     console.error('Failed to sync new event to server:', error);
   }
+}
+
+/**
+ * Scroll a day/week hour grid so a selected timed event's time is centered in the viewport;
+ * with no timed selection, fall back to the midday default.
+ */
+export function centerGridScroll(viewportEl: HTMLElement, selectedEvent?: EventOccurrence): void {
+  const fraction = selectedEvent && isTimed(selectedEvent) ? dayFraction(selectedEvent.start) : 0.5;
+  viewportEl.scrollTop = viewportEl.scrollHeight * fraction - viewportEl.clientHeight / 2;
 }

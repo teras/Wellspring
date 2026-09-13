@@ -24,6 +24,23 @@ describe('Contact', function () {
     expect(c1.email).toBe('evan@mailspring.com');
   });
 
+  it('trims surrounding whitespace from email addresses', function () {
+    const fromConstructor = new Contact({
+      name: 'Joash McBain',
+      email: ' joashm@fairfieldspecialtyeggs.com\t',
+    });
+    expect(fromConstructor.email).toBe('joashm@fairfieldspecialtyeggs.com');
+    expect(fromConstructor.isValid()).toBe(true);
+
+    const fromJSON = new Contact({});
+    fromJSON.fromJSON({
+      name: 'Joash McBain',
+      email: '\u00a0joashm@fairfieldspecialtyeggs.com\r\n',
+    });
+    expect(fromJSON.email).toBe('joashm@fairfieldspecialtyeggs.com');
+    expect(fromJSON.isValid()).toBe(true);
+  });
+
   it('correctly parses first and last names', function () {
     const c1 = new Contact({ name: 'Evan Morikawa' });
     expect(c1.firstName()).toBe('Evan');
@@ -144,6 +161,56 @@ describe('Contact', function () {
     const c1 = new Contact({ name: ' Test Monkey', email: this.account.emailAddress });
     expect(c1.displayName()).toBe('You (tester@mailspring.com)');
     expect(c1.displayName({ compact: true })).toBe('You');
+  });
+
+  describe('fromString', function () {
+    it('parses a name and an email address', function () {
+      const c1 = Contact.fromString('Ben Gotow <ben@mailspring.com>');
+      expect(c1.name).toBe('Ben Gotow');
+      expect(c1.email).toBe('ben@mailspring.com');
+    });
+
+    it('parses a bare email address', function () {
+      const c1 = Contact.fromString('ben@mailspring.com');
+      expect(c1.name).toBe('');
+      expect(c1.email).toBe('ben@mailspring.com');
+    });
+
+    it('assigns the accountId and a deterministic id', function () {
+      const c1 = Contact.fromString('Ben <ben@mailspring.com>', { accountId: 'a1' });
+      expect(c1.accountId).toBe('a1');
+      expect(c1.id).toBe('local-a1-ben@mailspring.com');
+    });
+
+    it('prefers the address in angle brackets when the string contains several', function () {
+      const c1 = Contact.fromString('ben@mailspring.com <ben@mailspring.com>');
+      expect(c1.name).toBe('ben@mailspring.com');
+      expect(c1.email).toBe('ben@mailspring.com');
+
+      const c2 = Contact.fromString('Ben (old: ben@old.com) <ben@mailspring.com>');
+      expect(c2.name).toBe('Ben (old: ben@old.com)');
+      expect(c2.email).toBe('ben@mailspring.com');
+    });
+
+    it('uses the last address when several appear without angle brackets', function () {
+      const c1 = Contact.fromString('ben@old.com ben@mailspring.com');
+      expect(c1.name).toBe('ben@old.com');
+      expect(c1.email).toBe('ben@mailspring.com');
+    });
+
+    it('does not throw when the string contains no email address', function () {
+      const c1 = Contact.fromString('Ben Gotow');
+      expect(c1.name).toBe('Ben Gotow');
+      expect(c1.email).toBe('');
+
+      const c2 = Contact.fromString('Ben Gotow <>');
+      expect(c2.name).toBe('Ben Gotow <>');
+      expect(c2.email).toBe('');
+
+      const c3 = Contact.fromString('');
+      expect(c3.name).toBe('');
+      expect(c3.email).toBe('');
+    });
   });
 
   describe('isMe', function () {

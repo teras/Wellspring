@@ -1,4 +1,5 @@
 import { parseICSString } from './calendar-utils';
+import { calendarDateFromUnix, shiftedDayStartUnix, calendarDaysBetween } from './calendar-date';
 
 type ICAL = typeof import('ical.js').default;
 type ICALComponent = InstanceType<ICAL['Component']>;
@@ -70,6 +71,80 @@ export function generateUID(): string {
 }
 
 /**
+ * How many occurrences an expander may step through before giving up on one series.
+ *
+ * ical-expander iterates forward from DTSTART with no way to seek, so a cap limits how far
+ * back a series may begin rather than how much work a window costs. Too low and a long
+ * running series silently expands to nothing: at 100, a weekly meeting that started three
+ * years ago never reaches the present and simply disappears from the calendar. Removing the
+ * cap is worse - an invitation is untrusted input, and `RRULE:FREQ=SECONDLY` dated 1970
+ * would spin forever.
+ *
+ * So the budget comes from the series itself: how many steps of its own frequency fit
+ * between where it starts and the end of the window, plus slack. Real calendars land far
+ * below the ceiling - a weekly meeting running since 2020 needs about 300 - while a
+ * frequency fine enough to be abusive exceeds it and is truncated instead of expanded.
+ *
+ * @param ics - The series' calendar object.
+ * @param seriesStartUnix - DTSTART of the series, in unix seconds.
+ * @param windowEndUnix - The end of the range being expanded, in unix seconds.
+ */
+export function expansionIterationBudget(
+  ics: string,
+  seriesStartUnix: number,
+  windowEndUnix: number
+): number {
+  // A master event can reach here with a null or non-finite recurrenceStart - the expansion
+  // fallback guards for exactly that. NaN would survive Math.max/Math.min and become the cap
+  // itself, and ical-expander's loop is `!this.maxIterations || i < this.maxIterations`
+  // (index.js:104), so a NaN cap switches the limit off rather than truncating.
+  if (!Number.isFinite(seriesStartUnix) || !Number.isFinite(windowEndUnix)) {
+    return MIN_EXPANSION_ITERATIONS;
+  }
+  const rule = firstVeventRRule(ics);
+  if (!rule) {
+    return MIN_EXPANSION_ITERATIONS; // not a series; one occurrence is all there is to reach
+  }
+  const freq = /FREQ=([A-Z]+)/i.exec(rule);
+  const interval = parseInt((/INTERVAL=(\d+)/i.exec(rule) || [])[1], 10) || 1;
+  const step =
+    (EXPANSION_STEP_SECONDS[(freq ? freq[1] : '').toUpperCase()] || EXPANSION_STEP_SECONDS.DAILY) *
+    interval;
+  const steps = Math.ceil(Math.max(0, windowEndUnix - seriesStartUnix) / step) + 100;
+  return Math.min(MAX_EXPANSION_ITERATIONS, Math.max(MIN_EXPANSION_ITERATIONS, steps));
+}
+
+/**
+ * The RRULE of the first VEVENT, ignoring any that belong to a VTIMEZONE.
+ *
+ * A VTIMEZONE's STANDARD and DAYLIGHT blocks each carry their own RRULE describing the
+ * zone's DST transitions, and they appear before the VEVENT - so a plain search for the
+ * first RRULE in the file returns `FREQ=YEARLY;BYMONTH=3;BYDAY=2SU` for a weekly meeting,
+ * and any budget derived from it is wrong by a factor of fifty.
+ */
+function firstVeventRRule(ics: string): string | null {
+  const unfolded = ics.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '');
+  const vevent = unfolded.split(/^BEGIN:VEVENT$/m)[1];
+  if (!vevent) return null;
+  const match = /^RRULE:(.*)$/im.exec(vevent.split(/^END:VEVENT$/m)[0]);
+  return match ? match[1] : null;
+}
+
+const EXPANSION_STEP_SECONDS: { [freq: string]: number } = {
+  SECONDLY: 1,
+  MINUTELY: 60,
+  HOURLY: 3600,
+  DAILY: 86400,
+  WEEKLY: 604800,
+  // Deliberately the shortest month and year. Underestimating the step overestimates the
+  // budget, which errs towards expanding a legitimate series rather than truncating it.
+  MONTHLY: 28 * 86400,
+  YEARLY: 365 * 86400,
+};
+const MIN_EXPANSION_ITERATIONS = 1000;
+const MAX_EXPANSION_ITERATIONS = 50000;
+
+/**
  * Formats a Date as an ICS date-only string (YYYYMMDD)
  * Uses LOCAL date components since all-day events represent a day in the user's timezone
  */
@@ -108,6 +183,24 @@ function createAllDayTime(date: Date, ical: ICAL): ICALTime {
     null // timezone parameter (null for floating/all-day)
   );
   return time;
+}
+
+/**
+ * Creates an ICAL.Time for an all-day event's DTEND, which RFC 5545 defines as exclusive:
+ * midnight of the day after the last day covered. Ends don't always arrive on midnight —
+ * the all-day toggle passes the event's untouched wall-clock time — and truncating those
+ * to a DATE would land on the start's own day.
+ * @param start Event start; floors the result so a degenerate end can't precede it
+ * @param end Event end; one already at midnight is not pushed out another day
+ */
+function createAllDayEndTime(start: Date, end: Date, ical: ICAL): ICALTime {
+  const lastCovered = new Date(Math.max(end.getTime() - 1, start.getTime()));
+  const exclusiveEnd = new Date(
+    lastCovered.getFullYear(),
+    lastCovered.getMonth(),
+    lastCovered.getDate() + 1
+  );
+  return createAllDayTime(exclusiveEnd, ical);
 }
 
 /**
@@ -370,7 +463,9 @@ export function createICSString(options: CreateEventOptions): string {
     // All-day or no-timezone: use existing path
     const eventTimezone: ICALTimezone | null = null;
     event.startDate = createICALTime(options.start, isAllDay, ical, eventTimezone);
-    event.endDate = createICALTime(options.end, isAllDay, ical, eventTimezone);
+    event.endDate = isAllDay
+      ? createAllDayEndTime(options.start, options.end, ical)
+      : createICALTime(options.end, false, ical, eventTimezone);
   }
 
   // Set optional properties
@@ -383,23 +478,26 @@ export function createICSString(options: CreateEventOptions): string {
 
   // Set organizer
   if (options.organizer) {
-    const organizer = vevent.addProperty('organizer' as any);
+    const organizer = new ical.Property('organizer');
     organizer.setValue(`mailto:${options.organizer.email}`);
     if (options.organizer.name) {
       organizer.setParameter('cn', options.organizer.name);
     }
+    vevent.addProperty(organizer);
   }
 
   // Set attendees
   if (options.attendees) {
     for (const attendee of options.attendees) {
-      const prop = vevent.addProperty('attendee' as any);
+      const prop = new ical.Property('attendee');
       prop.setValue(`mailto:${attendee.email}`);
       if (attendee.name) {
         prop.setParameter('cn', attendee.name);
       }
       prop.setParameter('partstat', 'NEEDS-ACTION');
       prop.setParameter('role', attendee.role || 'REQ-PARTICIPANT');
+      prop.setParameter('rsvp', 'TRUE');
+      vevent.addProperty(prop);
     }
   }
 
@@ -497,7 +595,9 @@ export function updateEventTimes(ics: string, options: UpdateTimesOptions): stri
     const originalStartZone = event.startDate?.zone;
     const originalEndZone = event.endDate?.zone;
     event.startDate = createICALTime(startDate, isAllDay, ical, originalStartZone);
-    event.endDate = createICALTime(endDate, isAllDay, ical, originalEndZone);
+    event.endDate = isAllDay
+      ? createAllDayEndTime(startDate, endDate, ical)
+      : createICALTime(endDate, false, ical, originalEndZone);
   }
 
   // Update DTSTAMP to indicate modification
@@ -597,7 +697,9 @@ export function createRecurrenceException(
   const newEndDate = new Date(newEnd * 1000);
   const exceptionICALEvent = new ical.Event(exceptionVevent);
   exceptionICALEvent.startDate = createICALTime(newStartDate, isAllDay, ical, originalStartZone);
-  exceptionICALEvent.endDate = createICALTime(newEndDate, isAllDay, ical, originalStartZone);
+  exceptionICALEvent.endDate = isAllDay
+    ? createAllDayEndTime(newStartDate, newEndDate, ical)
+    : createICALTime(newEndDate, false, ical, originalStartZone);
 
   // Update DTSTAMP and increment SEQUENCE on the exception
   const now = ical.Time.now();
@@ -686,13 +788,15 @@ export function applyEditsToException(
   if (edits.attendees !== undefined) {
     exceptionVevent.removeAllProperties('attendee');
     for (const attendee of edits.attendees) {
-      const prop = exceptionVevent.addProperty('attendee' as any);
+      const prop = new ical.Property('attendee');
       prop.setValue(`mailto:${attendee.email}`);
       if (attendee.name) {
         prop.setParameter('cn', attendee.name);
       }
       prop.setParameter('partstat', attendee.partstat || 'NEEDS-ACTION');
       prop.setParameter('role', 'REQ-PARTICIPANT');
+      prop.setParameter('rsvp', 'TRUE');
+      exceptionVevent.addProperty(prop);
     }
   }
 
@@ -735,11 +839,20 @@ export function shiftInlineExceptions(ics: string, deltaMs: number): string {
     if (!ridValue || typeof ridValue.toJSDate !== 'function') continue;
 
     const ridDate = ridValue.toJSDate();
-    const newRidDate = new Date(ridDate.getTime() + deltaMs);
 
+    // A DATE-valued RECURRENCE-ID has to move in whole days, matching how the master shifts.
+    // deltaMs is 23h or 25h across a DST transition, and adding that to a date lands inside
+    // the same day, so createAllDayTime would truncate it back and detach the exception.
+    // An all-day delta is always whole days give or take the transition hour, so round it.
     const newRidTime = (ridValue.isDate as boolean)
-      ? createAllDayTime(newRidDate, ical)
-      : ical.Time.fromJSDate(newRidDate, true); // Keep as UTC (same format as createRecurrenceException)
+      ? createAllDayTime(
+          new Date(
+            shiftedDayStartUnix(ridDate.getTime() / 1000, Math.round(deltaMs / 86400000)) * 1000
+          ),
+          ical
+        )
+      : // Keep as UTC (same format as createRecurrenceException)
+        ical.Time.fromJSDate(new Date(ridDate.getTime() + deltaMs), true);
 
     vevent.updatePropertyWithValue('recurrence-id', newRidTime);
     vevent.updatePropertyWithValue('dtstamp', ical.Time.now());
@@ -768,19 +881,37 @@ export function updateRecurringEventTimes(
 ): string {
   const { event } = parseICSString(ics);
 
-  // Calculate the time delta (how much the occurrence was moved)
-  const deltaMs = (newStart - originalOccurrenceStart) * 1000;
-
-  // Get current master event times and apply delta
   const currentStart = event.startDate.toJSDate().getTime();
-  const currentEnd = event.endDate.toJSDate().getTime();
 
-  const adjustedStart = (currentStart + deltaMs) / 1000;
-  const adjustedEnd = (currentEnd + deltaMs) / 1000;
+  if (isAllDay) {
+    // Shift the master start by the same whole days the occurrence moved, then span the new
+    // duration. Shifting by day count (not a ms delta) keeps the series on midnight across a
+    // spring-forward day, where a 23h ms shift would leave the date unchanged and the series
+    // silently wouldn't move.
+    const days = calendarDaysBetween(
+      calendarDateFromUnix(originalOccurrenceStart),
+      calendarDateFromUnix(newStart)
+    );
+    const spanDays = calendarDaysBetween(
+      calendarDateFromUnix(newStart),
+      calendarDateFromUnix(newEnd)
+    );
+    const newMasterStart = shiftedDayStartUnix(currentStart / 1000, days);
+    return updateEventTimes(ics, {
+      start: newMasterStart,
+      end: shiftedDayStartUnix(newMasterStart, spanDays),
+      isAllDay,
+    });
+  }
 
+  // Shift the master start by the occurrence's move delta, then apply the new duration, so a
+  // resize (which changes newEnd relative to newStart) actually changes the whole series.
+  const deltaMs = (newStart - originalOccurrenceStart) * 1000;
+  const durationMs = (newEnd - newStart) * 1000;
+  const newMasterStart = currentStart + deltaMs;
   return updateEventTimes(ics, {
-    start: adjustedStart,
-    end: adjustedEnd,
+    start: newMasterStart / 1000,
+    end: (newMasterStart + durationMs) / 1000,
     isAllDay,
   });
 }
@@ -931,13 +1062,15 @@ export function updateAttendees(
 
   // Add new attendees
   for (const attendee of attendees) {
-    const prop = vevent.addProperty('attendee' as any);
+    const prop = new ical.Property('attendee');
     prop.setValue(`mailto:${attendee.email}`);
     if (attendee.name) {
       prop.setParameter('cn', attendee.name);
     }
     prop.setParameter('partstat', attendee.partstat || 'NEEDS-ACTION');
     prop.setParameter('role', 'REQ-PARTICIPANT');
+    prop.setParameter('rsvp', 'TRUE');
+    vevent.addProperty(prop);
   }
 
   // Update DTSTAMP

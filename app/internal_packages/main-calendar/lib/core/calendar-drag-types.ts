@@ -1,3 +1,5 @@
+import { MIN_EVENT_DURATION_SECONDS } from './calendar-constants';
+
 import { EventOccurrence } from './calendar-data-source';
 
 /**
@@ -47,9 +49,6 @@ export interface DragState {
   /** Original end time (unix timestamp) - for calculating deltas and cancellation */
   originalEnd: number;
 
-  /** Unix timestamp at the initial mouse position when drag started */
-  initialMouseTime: number;
-
   /** Offset between click position and event start (for 'move' mode) - preserves grab point */
   clickOffset: number;
 
@@ -64,6 +63,13 @@ export interface DragState {
 
   /** Current preview end time (updated during drag) */
   previewEnd: number;
+
+  /**
+   * Whether the current drop position would make the event all-day — true for an all-day event,
+   * or a timed event dragged onto the all-day row (which converts). Drives the preview's kind
+   * and how the drop persists.
+   */
+  previewIsAllDay: boolean;
 
   /** Time snapping interval in seconds (e.g., 900 for 15 minutes) */
   snapIntervalSeconds: number;
@@ -99,7 +105,7 @@ export const DEFAULT_DRAG_CONFIG: DragConfig = {
   dragThreshold: 5,
   snapInterval: 900, // 15 minutes
   edgeZoneSize: 12, // Larger zone for easier grab
-  minDuration: 900, // 15 minutes
+  minDuration: MIN_EVENT_DURATION_SECONDS,
   direction: 'vertical',
 };
 
