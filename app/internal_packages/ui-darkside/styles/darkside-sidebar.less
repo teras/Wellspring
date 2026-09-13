@@ -42,29 +42,28 @@
 // Down arrow icon
 .account-switcher {
   height: 14px;
-  width: 16px;
+  width: 14px;
   top: 0;
   right: 0;
   display: flex;
   justify-content: center;
   align-items: center;
-  opacity: 0.5;
+  opacity: 0.9;
   transition: opacity 200ms;
   &:hover {
     opacity: 1;
   }
 }
 
-// Down arrow icon
+// Down arrow icon: the source png is dark (ContentDark) and darkside has no
+// content-dark invert rule, so force it white with a filter (same trick ui-dark
+// uses) instead of the fragile mask/background hack.
 .account-switcher img {
   zoom: 1 !important;
-  max-width: 10px;
-  max-height: 6px;
-  transform: none;
-  background-image: none;
-  background-color: @sidebar-text;
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path fill="#FFF" d="M0 0h1l4 4 4-4h1v1L5 6 0 1z"/></svg>');
+  max-width: 14px;
+  max-height: 14px;
+  transform: rotateX(180deg);
+  filter: brightness(0) invert(1);
 }
 
 .account-sidebar .item,
