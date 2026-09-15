@@ -17,19 +17,30 @@ const configCredentialsKey = 'credentials';
 // The real keychain varies by platform and may be locked or absent, so specs replace this.
 //
 // FORK-LOCAL: use the synchronous safeStorage API, not the async one upstream switched to in
-// #2823. On Linux the async path (encrypt/decryptStringAsync) routes through the Secret Portal
-// (org.freedesktop.portal.Secret), which is absent on KDE/Plasma setups that only expose
-// org.freedesktop.Secret.Service (ksecretd/kwallet). There the async decrypt throws and the app
-// refuses to start, and it cannot read blobs the sync API wrote in earlier versions regardless.
-// The sync API talks to Secret.Service directly and decrypts our existing credentials. Wrapped in
-// Promise.resolve so the rest of this async-shaped code is unchanged; sync has no re-encrypt hint.
+// #2823. Upstream's #2864 KWallet fix still writes and reads on the async path
+// (encrypt/decryptStringAsync), falling back to the sync API only to read legacy 1.23 blobs. On
+// KWallet6 + Electron 44 (this fork's target) the async API cannot read its own fresh output:
+// encryptStringAsync → decryptStringAsync round-trips to the WRONG plaintext and does NOT throw,
+// so _getKeyHash below would JSON.parse garbage, treat the keyset as empty, and let the next write
+// erase every account's password. The sync API talks to Secret.Service directly and round-trips
+// deterministically. So encrypt/decrypt stay sync; decryptLegacy is likewise sync and exists only
+// to satisfy _getKeyHash's fallback reference. Wrapped in Promise.resolve to keep the async-shaped
+// callers unchanged; sync has no re-encrypt hint.
 export const secureStorage = {
   isAvailable: (): Promise<boolean> => Promise.resolve(safeStorage.isEncryptionAvailable()),
   encrypt: (plaintext: string): Promise<Buffer> =>
     Promise.resolve(safeStorage.encryptString(plaintext)),
   decrypt: (encrypted: Buffer): Promise<DecryptResult> =>
     Promise.resolve({ result: safeStorage.decryptString(encrypted), shouldReEncrypt: false }),
+  decryptLegacy: (encrypted: Buffer): string => safeStorage.decryptString(encrypted),
 };
+
+// On Linux, Chromium's async keyring always has a last-resort provider whose key is a hardcoded
+// constant ("peanuts"); its ciphertexts are tagged "v10" instead of a real keyring's "v11".
+// isAsyncEncryptionAvailable() resolves true even when only that provider initialized, so the
+// tag is the only signal that the desktop keyring is unusable.
+const usesPlaintextFallbackKey = (encrypted: Buffer) =>
+  process.platform === 'linux' && encrypted.subarray(0, 3).toString() === 'v10';
 
 /**
  * A basic wrap around electron's secure key management. Consolidates all of
@@ -121,19 +132,26 @@ class KeyManager {
       return {} as KeySet;
     }
 
+    const encrypted = Buffer.from(encryptedCredentials, 'utf-8');
     let decrypted: DecryptResult;
     try {
-      decrypted = await secureStorage.decrypt(Buffer.from(encryptedCredentials, 'utf-8'));
-    } catch (err) {
-      // Stored-but-unreadable is not the same as nothing stored. Resolving to an empty keyset
-      // would let the next read-modify-write mutator persist it, erasing every account's
-      // password over a locked keyring or a secret service that has not started yet.
-      this._reportFatalError(
-        new Error(
-          localized('Mailspring could not read your saved passwords and cannot continue.') +
-            this._encryptionUnavailableHint()
-        )
-      );
+      decrypted = await secureStorage.decrypt(encrypted);
+    } catch (asyncErr) {
+      try {
+        // A blob from 1.23 or earlier. Flag it so it is rewritten with the async key below.
+        decrypted = { result: secureStorage.decryptLegacy(encrypted), shouldReEncrypt: true };
+      } catch (syncErr) {
+        // Stored-but-unreadable is not the same as nothing stored. Resolving to an empty keyset
+        // would let the next read-modify-write mutator persist it, erasing every account's
+        // password over a locked keyring or a secret service that has not started yet.
+        console.error('Mailspring could not read saved passwords.', asyncErr, syncErr);
+        this._reportFatalError(
+          new Error(
+            localized('Mailspring could not read your saved passwords and cannot continue.') +
+              this._encryptionUnavailableHint()
+          )
+        );
+      }
     }
 
     let keys: KeySet;
@@ -144,9 +162,10 @@ class KeyManager {
       return {} as KeySet;
     }
 
-    // Chromium raises this when the provider that encrypts new data is not the one this blob
-    // was written with, as it migrates Linux users to org.freedesktop.portal.Secret. The old key
-    // still decrypts, so this is hygiene: rewrite once, and never let a failure become fatal.
+    // Set by Chromium when the provider that encrypts new data is not the one this blob was
+    // written with (e.g. Linux users moving to org.freedesktop.portal.Secret), and by the legacy
+    // path above. The old key still decrypts, so this is hygiene: rewrite once, and never let a
+    // failure become fatal.
     if (decrypted.shouldReEncrypt && !this._reEncryptAttempted) {
       this._reEncryptAttempted = true;
       try {
@@ -162,21 +181,26 @@ class KeyManager {
   _encryptionUnavailableHint() {
     return process.platform === 'linux'
       ? localized(
-          ' On Linux, Mailspring requires a secret service such as org.freedesktop.portal.Secret or org.freedesktop.Secret.Service. Please ensure a provider is installed and running, then restart Mailspring.'
+          ' On Linux, Mailspring stores passwords in your desktop keyring (KWallet, GNOME Keyring, or another Secret Service provider). Please make sure it is installed, running, and unlocked, then restart Mailspring.'
         )
       : '';
   }
 
   async _writeKeyHash(keys: KeySet) {
-    if (!(await secureStorage.isAvailable())) {
-      throw new Error(
+    const unavailable = () =>
+      new Error(
         localized(
           `Mailspring could not store your password securely because encryption is not available on this system.`
         ) + this._encryptionUnavailableHint()
       );
+    if (!(await secureStorage.isAvailable())) {
+      throw unavailable();
     }
-    const enrcyptedCredentials = await secureStorage.encrypt(JSON.stringify(keys));
-    AppEnv.config.set(configCredentialsKey, enrcyptedCredentials);
+    const encryptedCredentials = await secureStorage.encrypt(JSON.stringify(keys));
+    if (usesPlaintextFallbackKey(encryptedCredentials)) {
+      throw unavailable();
+    }
+    AppEnv.config.set(configCredentialsKey, encryptedCredentials);
   }
 
   _reportFatalError(err: Error): never {
