@@ -33,8 +33,10 @@ jobs:
             app/*.so*
           key: mailsync-${{ runner.os }}-ubuntu2204-${{ steps.mailsync-rev.outputs.rev }}
 
+      # Runs on cache hits too: the cached mailsync links these shared libraries at
+      # runtime, and without them the spec runner's `mailsync --mode migrate` fails
+      # into a modal error dialog that hangs the job until its timeout.
       - name: Install mailsync build dependencies
-        if: steps.mailsync-cache.outputs.cache-hit != 'true'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
