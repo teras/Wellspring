@@ -52,7 +52,7 @@ jobs:
             libicu-dev liblzma-dev libsasl2-dev libsasl2-modules libsasl2-modules-gssapi-mit \
             libsecret-1-dev libssl-dev libnss3 libnss3-dev libtidy-dev libtool \
             libxext-dev libxkbfile-dev libxml2-dev libxtst-dev pkg-config rpm \
-            uuid-dev xvfb
+            uuid-dev xvfb clang-15
 
       - name: Get mailsync revision
         id: mailsync-rev
@@ -78,8 +78,14 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
+      # Electron 44's V8 headers put [[deprecated]] before __attribute__ in a class head
+      # and use std::source_location, which jammy's gcc 11/12 and clang 14 reject. clang-15
+      # still builds against jammy's libstdc++, so the glibc/GLIBCXX baseline is unchanged.
       - name: Install dependencies
         run: npm ci
+        env:
+          CC: clang-15
+          CXX: clang++-15
 
       - name: Set product version
         if: needs.meta.outputs.version != 'dev'
@@ -89,6 +95,9 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          CC: clang-15
+          CXX: clang++-15
 
       - name: Collect artifacts
         run: |

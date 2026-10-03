@@ -1,4 +1,6 @@
 import React from 'react';
+import { findDOMNode } from 'react-dom';
+import ReactTestUtils from 'react-dom/test-utils';
 import FixedPopover from '../../src/components/fixed-popover';
 import MTestUtils from '../mailspring-test-utils';
 
@@ -295,6 +297,94 @@ describe('FixedPopover', function fixedPopover() {
         });
         expect(popoverStyle.transform).toContain('translate(12px, 34px)');
       });
+    });
+  });
+
+  describe('when the content changes size after placement', () => {
+    // The spec window is hidden, and a hidden renderer produces frames irregularly, so a real
+    // ResizeObserver may not report within any timeout. This one reports when the spec says so.
+    let observers: FakeResizeObserver[];
+    class FakeResizeObserver {
+      observed = new Set<Element>();
+      constructor(public callback: ResizeObserverCallback) {
+        observers.push(this);
+      }
+      observe(el: Element) {
+        this.observed.add(el);
+      }
+      unobserve(el: Element) {
+        this.observed.delete(el);
+      }
+      disconnect() {
+        this.observed.clear();
+      }
+    }
+    const reportResizes = () => {
+      for (const o of observers) {
+        for (const target of o.observed) {
+          o.callback([{ target } as ResizeObserverEntry], o as any);
+        }
+      }
+    };
+
+    let RealResizeObserver: typeof ResizeObserver;
+    beforeEach(() => {
+      observers = [];
+      RealResizeObserver = window.ResizeObserver;
+      (window as any).ResizeObserver = FakeResizeObserver;
+    });
+    afterEach(() => {
+      window.ResizeObserver = RealResizeObserver;
+    });
+
+    // The default export is the AutoFocuses decorator, which renders the FixedPopover inside it;
+    // placement state, refs and the ResizeObserver live on that inner instance.
+    const mountWithChild = (height: number, width = 200, originLeft = 10) => {
+      const outer = makePopover({
+        direction: Right,
+        originRect: { top: 400, left: originLeft, width: 50, height: 20 },
+        children: <div className="grows" style={{ width, height }} />,
+      });
+      const inner = ReactTestUtils.findAllInRenderedTree(
+        outer,
+        (c: any) => c !== outer && c.state && 'visible' in c.state
+      )[0] as any;
+      spyOn(inner, 'getWindowDimensions').andReturn({ width: 500, height: 500 });
+      return inner;
+    };
+
+    // Placement runs in deferred passes on the mocked clock.
+    const settle = () => {
+      for (let i = 0; i < 5; i++) advanceClock(10);
+    };
+
+    it('places the popover again so it comes back inside the window', () => {
+      const popover = mountWithChild(100);
+      settle();
+      expect(popover.state.visible).toBe(true);
+      expect(popover.getCurrentRect().top).toBeGreaterThan(0);
+
+      (findDOMNode(popover) as HTMLElement).querySelector<HTMLElement>('.grows').style.height =
+        '2000px';
+      reportResizes();
+      expect(popover.placing).toBe(true);
+      settle();
+      expect(popover.placing).toBe(false);
+      expect(popover.state.visible).toBe(true);
+      expect(popover.getCurrentRect().top).toBeGreaterThan(0);
+    });
+
+    it('starts again from the requested direction once the content fits it', () => {
+      const popover = mountWithChild(100, 200, 250);
+      settle();
+      expect(popover.state.direction).toBe(Left);
+
+      (findDOMNode(popover) as HTMLElement).querySelector<HTMLElement>('.grows').style.width =
+        '50px';
+      reportResizes();
+      settle();
+      expect(popover.state.direction).toBe(Right);
+      expect(popover.state.visible).toBe(true);
     });
   });
 });

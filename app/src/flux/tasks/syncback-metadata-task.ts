@@ -78,6 +78,14 @@ export class SyncbackMetadataTask extends Task {
     this.canBeUndone = !!this.undoValue;
   }
 
+  // Tasks crossing windows (Undo Send queued from a popout composer) are inflated with
+  // `new Task()` followed by fromJSON, so undoValue only arrives here.
+  fromJSON(json: any) {
+    super.fromJSON(json);
+    this.canBeUndone = !!this.undoValue;
+    return this;
+  }
+
   description() {
     return null;
   }

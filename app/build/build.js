@@ -288,6 +288,10 @@ function buildPackagerOptions() {
           // neither the main nor the child entitlements may carry restricted
           // entitlements in that case.
           provisioningProfile: process.env.APPLE_PROVISIONING_PROFILE_PATH,
+          // Name or SHA-1 of the signing certificate. Needed when a keychain holds several
+          // "Developer ID Application" certs: signing with one the profile doesn't list makes
+          // amfid reject the restricted entitlements and the app refuses to launch.
+          identity: process.env.APPLE_SIGNING_IDENTITY,
           optionsForFile: filePath => {
             // Main app bundle and helper binaries (Electron helpers, mailsync,
             // chrome_crashpad_handler, ShipIt, etc.) are all signed with only
@@ -329,6 +333,10 @@ function buildPackagerOptions() {
     //   CFBundleDisplayName, CFBundleExecutable, CFBundleIdentifier, CFBundleName
     // See https://github.com/electron-userland/electron-packager/blob/master/mac.js#L50
     extendInfo: path.resolve(appDir, 'build', 'resources', 'mac', 'extra.plist'),
+    extraResource:
+      platform === 'darwin'
+        ? [path.resolve(appDir, 'build', 'resources', 'mac', 'new-mail.mp3')]
+        : undefined,
     appBundleId: 'com.mailspring.mailspring',
     afterCopy: [
       runCopyPlatformSpecificResources,
